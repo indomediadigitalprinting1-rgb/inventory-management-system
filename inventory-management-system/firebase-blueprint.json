@@ -1,0 +1,422 @@
+{
+  "entities": {
+    "SystemConfig": {
+      "title": "SystemConfig",
+      "description": "Global system initialization and operational configuration.",
+      "type": "object",
+      "properties": {
+        "initialized": { "type": "boolean" },
+        "ownerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerEmail": { "type": "string", "maxLength": 200 },
+        "companyName": { "type": "string", "maxLength": 160 },
+        "lowStockAlertEnabled": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["initialized", "ownerUid", "ownerEmail", "companyName", "lowStockAlertEnabled", "updatedAt"]
+    },
+    "AdminSlot": {
+      "title": "AdminSlot",
+      "description": "Concurrency-safe singleton lock guaranteeing at most one ADMIN account.",
+      "type": "object",
+      "properties": {
+        "occupied": { "type": "boolean" },
+        "adminUid": { "type": "string", "maxLength": 128 },
+        "adminEmail": { "type": "string", "maxLength": 200 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["occupied", "updatedAt"]
+    },
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "Authenticated application user with strict server-validated RBAC role.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "maxLength": 200 },
+        "name": { "type": "string", "maxLength": 120 },
+        "role": { "type": "string", "enum": ["OWNER", "ADMIN", "PRODUKSI"] },
+        "department": { "type": "string", "maxLength": 80 },
+        "active": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "name", "role", "department", "active", "createdAt", "updatedAt"]
+    },
+    "UserInvite": {
+      "title": "UserInvite",
+      "description": "Owner-authorized account provisioning record bound by email.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "maxLength": 200 },
+        "name": { "type": "string", "maxLength": 120 },
+        "role": { "type": "string", "enum": ["ADMIN", "PRODUKSI"] },
+        "department": { "type": "string", "maxLength": 80 },
+        "active": { "type": "boolean" },
+        "claimedUid": { "type": "string", "maxLength": 128 },
+        "createdByUid": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "email", "name", "role", "department", "active", "createdByUid", "createdAt", "updatedAt"]
+    },
+    "Category": {
+      "title": "Category",
+      "description": "Master item category.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "code": { "type": "string", "maxLength": 32 },
+        "name": { "type": "string", "maxLength": 100 },
+        "description": { "type": "string", "maxLength": 300 },
+        "active": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "code", "name", "active", "createdAt", "updatedAt"]
+    },
+    "Unit": {
+      "title": "Unit",
+      "description": "Master measurement unit.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "code": { "type": "string", "maxLength": 24 },
+        "name": { "type": "string", "maxLength": 80 },
+        "description": { "type": "string", "maxLength": 300 },
+        "active": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "code", "name", "active", "createdAt", "updatedAt"]
+    },
+    "Supplier": {
+      "title": "Supplier",
+      "description": "Master supplier contact and address record.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "code": { "type": "string", "maxLength": 32 },
+        "name": { "type": "string", "maxLength": 140 },
+        "contactPerson": { "type": "string", "maxLength": 100 },
+        "phone": { "type": "string", "maxLength": 40 },
+        "email": { "type": "string", "maxLength": 160 },
+        "address": { "type": "string", "maxLength": 400 },
+        "active": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "code", "name", "active", "createdAt", "updatedAt"]
+    },
+    "InventoryItem": {
+      "title": "InventoryItem",
+      "description": "Master inventory item with stock balances and Code 128 barcode.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "code": { "type": "string", "maxLength": 64 },
+        "barcode": { "type": "string", "maxLength": 64 },
+        "name": { "type": "string", "maxLength": 180 },
+        "categoryId": { "type": "string", "maxLength": 128 },
+        "categoryName": { "type": "string", "maxLength": 100 },
+        "specification": { "type": "string", "maxLength": 500 },
+        "unitId": { "type": "string", "maxLength": 128 },
+        "unitName": { "type": "string", "maxLength": 80 },
+        "initialStock": { "type": "number" },
+        "currentStock": { "type": "number" },
+        "minStock": { "type": "number" },
+        "purchasePrice": { "type": "number" },
+        "supplierId": { "type": "string", "maxLength": 128 },
+        "supplierName": { "type": "string", "maxLength": 140 },
+        "active": { "type": "boolean" },
+        "hasTransactions": { "type": "boolean" },
+        "createdByUid": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "code", "barcode", "name", "categoryId", "categoryName",
+        "unitId", "unitName", "initialStock", "currentStock", "minStock",
+        "purchasePrice", "supplierId", "supplierName", "active", "hasTransactions",
+        "createdByUid", "createdAt", "updatedAt"
+      ]
+    },
+    "UniqueCodeLock": {
+      "title": "UniqueCodeLock",
+      "description": "Uniqueness reservation record for item SKU codes and barcodes.",
+      "type": "object",
+      "properties": {
+        "itemId": { "type": "string", "maxLength": 128 },
+        "value": { "type": "string", "maxLength": 64 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["itemId", "value", "createdAt"]
+    },
+    "IncomingTransaction": {
+      "title": "IncomingTransaction",
+      "description": "Incoming goods transaction header and line items.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "txNumber": { "type": "string", "maxLength": 64 },
+        "date": { "type": "string", "maxLength": 32 },
+        "supplierId": { "type": "string", "maxLength": 128 },
+        "supplierName": { "type": "string", "maxLength": 140 },
+        "items": { "type": "array" },
+        "totalAmount": { "type": "number" },
+        "notes": { "type": "string", "maxLength": 500 },
+        "status": { "type": "string", "enum": ["DRAFT", "CONFIRMED", "REVERSED"] },
+        "reversalOfId": { "type": "string", "maxLength": 128 },
+        "idempotencyKey": { "type": "string", "maxLength": 128 },
+        "createdByUid": { "type": "string", "maxLength": 128 },
+        "createdByName": { "type": "string", "maxLength": 120 },
+        "confirmedByUid": { "type": "string", "maxLength": 128 },
+        "confirmedByName": { "type": "string", "maxLength": 120 },
+        "confirmedAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "txNumber", "date", "supplierId", "supplierName", "items",
+        "totalAmount", "status", "idempotencyKey", "createdByUid", "createdByName",
+        "createdAt", "updatedAt"
+      ]
+    },
+    "StockRequest": {
+      "title": "StockRequest",
+      "description": "Production material requisition supporting multi-item and partial approvals/deliveries.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "requestNumber": { "type": "string", "maxLength": 64 },
+        "requesterUid": { "type": "string", "maxLength": 128 },
+        "requesterName": { "type": "string", "maxLength": 120 },
+        "department": { "type": "string", "maxLength": 80 },
+        "notes": { "type": "string", "maxLength": 500 },
+        "status": {
+          "type": "string",
+          "enum": [
+            "MENUNGGU_PERSETUJUAN",
+            "DISETUJUI",
+            "DITOLAK",
+            "SIAP_DIAMBIL",
+            "DALAM_PROSES_PENGAMBILAN",
+            "SELESAI",
+            "DIBATALKAN"
+          ]
+        },
+        "items": { "type": "array" },
+        "approvedByUid": { "type": "string", "maxLength": 128 },
+        "approvedByName": { "type": "string", "maxLength": 120 },
+        "rejectionReason": { "type": "string", "maxLength": 400 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "requestNumber", "requesterUid", "requesterName", "department",
+        "status", "items", "createdAt", "updatedAt"
+      ]
+    },
+    "DeliveryRecord": {
+      "title": "DeliveryRecord",
+      "description": "Confirmed partial or full handover producing an immutable stock-out record.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "deliveryNumber": { "type": "string", "maxLength": 64 },
+        "stockOutNumber": { "type": "string", "maxLength": 64 },
+        "requestId": { "type": "string", "maxLength": 128 },
+        "requestNumber": { "type": "string", "maxLength": 64 },
+        "requesterUid": { "type": "string", "maxLength": 128 },
+        "requesterName": { "type": "string", "maxLength": 120 },
+        "items": { "type": "array" },
+        "notes": { "type": "string", "maxLength": 500 },
+        "deliveredByUid": { "type": "string", "maxLength": 128 },
+        "deliveredByName": { "type": "string", "maxLength": 120 },
+        "idempotencyKey": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "deliveryNumber", "stockOutNumber", "requestId", "requestNumber",
+        "requesterUid", "requesterName", "items", "deliveredByUid", "deliveredByName",
+        "idempotencyKey", "createdAt"
+      ]
+    },
+    "StockAdjustment": {
+      "title": "StockAdjustment",
+      "description": "Owner-only recorded stock opname or balance adjustment.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "txNumber": { "type": "string", "maxLength": 64 },
+        "itemId": { "type": "string", "maxLength": 128 },
+        "itemCode": { "type": "string", "maxLength": 64 },
+        "itemName": { "type": "string", "maxLength": 180 },
+        "type": { "type": "string", "enum": ["INCREASE", "DECREASE", "OPNAME"] },
+        "previousStock": { "type": "number" },
+        "qtyChange": { "type": "number" },
+        "newStock": { "type": "number" },
+        "reason": { "type": "string", "maxLength": 400 },
+        "idempotencyKey": { "type": "string", "maxLength": 128 },
+        "createdByUid": { "type": "string", "maxLength": 128 },
+        "createdByName": { "type": "string", "maxLength": 120 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "txNumber", "itemId", "itemCode", "itemName", "type",
+        "previousStock", "qtyChange", "newStock", "reason", "idempotencyKey",
+        "createdByUid", "createdByName", "createdAt"
+      ]
+    },
+    "StockLedgerEntry": {
+      "title": "StockLedgerEntry",
+      "description": "Permanent immutable stock card (Kartu Stok) movement ledger.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "date": { "type": "string", "maxLength": 32 },
+        "txNumber": { "type": "string", "maxLength": 64 },
+        "txType": { "type": "string", "enum": ["MASUK", "KELUAR", "PENYESUAIAN", "PEMBALIK"] },
+        "referenceId": { "type": "string", "maxLength": 128 },
+        "itemId": { "type": "string", "maxLength": 128 },
+        "itemCode": { "type": "string", "maxLength": 64 },
+        "itemName": { "type": "string", "maxLength": 180 },
+        "categoryName": { "type": "string", "maxLength": 100 },
+        "unitName": { "type": "string", "maxLength": 80 },
+        "qtyIn": { "type": "number" },
+        "qtyOut": { "type": "number" },
+        "balanceAfter": { "type": "number" },
+        "notes": { "type": "string", "maxLength": 500 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "userName": { "type": "string", "maxLength": 120 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "date", "txNumber", "txType", "referenceId", "itemId", "itemCode",
+        "itemName", "categoryName", "unitName", "qtyIn", "qtyOut", "balanceAfter",
+        "userId", "userName", "createdAt"
+      ]
+    },
+    "NotificationItem": {
+      "title": "NotificationItem",
+      "description": "Role-targeted operational notification.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "targetRole": { "type": "string", "enum": ["OWNER", "ADMIN", "PRODUKSI"] },
+        "targetUid": { "type": "string", "maxLength": 128 },
+        "type": { "type": "string", "maxLength": 64 },
+        "title": { "type": "string", "maxLength": 140 },
+        "message": { "type": "string", "maxLength": 400 },
+        "linkView": { "type": "string", "maxLength": 64 },
+        "relatedId": { "type": "string", "maxLength": 128 },
+        "readBy": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "targetRole", "type", "title", "message", "readBy", "createdAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Immutable security and operational audit trail.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "actorUid": { "type": "string", "maxLength": 128 },
+        "actorName": { "type": "string", "maxLength": 120 },
+        "actorRole": { "type": "string", "enum": ["OWNER", "ADMIN", "PRODUKSI"] },
+        "action": { "type": "string", "maxLength": 80 },
+        "entityType": { "type": "string", "maxLength": 64 },
+        "entityId": { "type": "string", "maxLength": 128 },
+        "description": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "actorUid", "actorName", "actorRole", "action", "entityType", "entityId", "description", "createdAt"]
+    },
+    "IdempotencyKey": {
+      "title": "IdempotencyKey",
+      "description": "Transaction deduplication guard.",
+      "type": "object",
+      "properties": {
+        "key": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "operation": { "type": "string", "maxLength": 64 },
+        "actorUid": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["key", "operation", "actorUid", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/system/config": {
+      "schema": { "$ref": "#/entities/SystemConfig" },
+      "description": "Singleton system configuration and initial owner binding."
+    },
+    "/system/adminSlot": {
+      "schema": { "$ref": "#/entities/AdminSlot" },
+      "description": "Singleton lock enforcing at most one ADMIN account."
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserAccount" },
+      "description": "Authenticated user profiles with RBAC roles."
+    },
+    "/userInvites/{inviteId}": {
+      "schema": { "$ref": "#/entities/UserInvite" },
+      "description": "Owner-provisioned user authorizations indexed by sanitized email."
+    },
+    "/categories/{categoryId}": {
+      "schema": { "$ref": "#/entities/Category" },
+      "description": "Master categories."
+    },
+    "/units/{unitId}": {
+      "schema": { "$ref": "#/entities/Unit" },
+      "description": "Master units."
+    },
+    "/suppliers/{supplierId}": {
+      "schema": { "$ref": "#/entities/Supplier" },
+      "description": "Master suppliers."
+    },
+    "/items/{itemId}": {
+      "schema": { "$ref": "#/entities/InventoryItem" },
+      "description": "Master inventory items."
+    },
+    "/itemCodes/{codeKey}": {
+      "schema": { "$ref": "#/entities/UniqueCodeLock" },
+      "description": "Unique SKU code enforcement."
+    },
+    "/itemBarcodes/{barcodeKey}": {
+      "schema": { "$ref": "#/entities/UniqueCodeLock" },
+      "description": "Unique barcode enforcement."
+    },
+    "/incomingTransactions/{txId}": {
+      "schema": { "$ref": "#/entities/IncomingTransaction" },
+      "description": "Incoming goods transactions."
+    },
+    "/stockRequests/{requestId}": {
+      "schema": { "$ref": "#/entities/StockRequest" },
+      "description": "Production material requests."
+    },
+    "/deliveries/{deliveryId}": {
+      "schema": { "$ref": "#/entities/DeliveryRecord" },
+      "description": "Confirmed stock deliveries / stock-out records."
+    },
+    "/stockAdjustments/{adjId}": {
+      "schema": { "$ref": "#/entities/StockAdjustment" },
+      "description": "Owner stock adjustments and opname records."
+    },
+    "/stockLedgers/{ledgerId}": {
+      "schema": { "$ref": "#/entities/StockLedgerEntry" },
+      "description": "Immutable stock card ledger entries."
+    },
+    "/notifications/{notifId}": {
+      "schema": { "$ref": "#/entities/NotificationItem" },
+      "description": "Operational notifications."
+    },
+    "/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Immutable audit trail."
+    },
+    "/idempotencyKeys/{key}": {
+      "schema": { "$ref": "#/entities/IdempotencyKey" },
+      "description": "Atomic transaction deduplication keys."
+    }
+  }
+}

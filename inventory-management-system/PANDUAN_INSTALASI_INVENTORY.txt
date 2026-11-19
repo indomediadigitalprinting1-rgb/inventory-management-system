@@ -1,0 +1,261 @@
+================================================================================
+PANDUAN INSTALASI, KONFIGURASI & OPERASIONAL
+INVENTORY MANAGEMENT SYSTEM (MULTI-ROLE FIREBASE EDITION)
+================================================================================
+
+Dokumen ini merupakan panduan resmi instalasi, deployment, keamanan, dan
+operasional harian untuk aplikasi INVENTORY MANAGEMENT SYSTEM berbasis:
+- React.js + TypeScript + Tailwind CSS
+- Firebase Authentication + Firebase Firestore + Firebase Hosting
+- JsBarcode (Code 128) + ZXing Browser Camera Scanner
+- Recharts + SheetJS (Excel .xlsx) + jsPDF (PDF & Label Thermal/A4)
+
+--------------------------------------------------------------------------------
+1. PERSYARATAN PERANGKAT & LINGKUNGAN
+--------------------------------------------------------------------------------
+Server / Komputer Pengembang:
+- Sistem Operasi: Windows 10/11, macOS 12+, atau Linux (Ubuntu 20.04+/Debian)
+- RAM minimal 4 GB (disarankan 8 GB)
+- Koneksi internet stabil untuk mengunduh dependency npm dan deploy Firebase
+- Browser modern: Google Chrome 110+, Microsoft Edge, atau Safari 16+
+
+Perangkat Pengguna Operasional (Desktop, Tablet & HP):
+- Komputer/Laptop: Browser Chrome/Edge/Firefox terbaru
+- Smartphone Android/iOS (untuk scan barcode kamera):
+  * Android: Chrome terbaru
+  * iOS / iPhone: Safari 15+ (wajib diakses melalui protokol HTTPS!)
+
+--------------------------------------------------------------------------------
+2. INSTALASI NODE.JS & DEPENDENCY PROJECT
+--------------------------------------------------------------------------------
+1. Unduh dan pasang Node.js LTS (versi 20.x atau 22.x) dari:
+   https://nodejs.org/
+
+2. Verifikasi instalasi Node.js dan npm di terminal:
+   node -v
+   npm -v
+
+3. Masuk ke direktori project dan pasang seluruh dependency:
+   npm install
+
+4. Pasang Firebase CLI secara global (untuk deployment & rules):
+   npm install -g firebase-tools
+
+--------------------------------------------------------------------------------
+3. SETUP FIREBASE PROJECT
+--------------------------------------------------------------------------------
+Catatan: Pada lingkungan Google AI Studio, konfigurasi project dan database ID
+sudah dibuatkan otomatis pada file `firebase-applet-config.json`. Jika Anda
+ingin memindahkan atau deploy ke project Firebase milik perusahaan sendiri:
+
+1. Buka https://console.firebase.google.com/
+2. Klik "Add project" / "Buat project" (misal: `inventory-perusahaan-anda`).
+3. Tambahkan aplikasi Web (`</>`) pada Project Overview, lalu salin konfigurasi
+   `firebaseConfig` ke file `firebase-applet-config.json`.
+   Pastikan `firestoreDatabaseId` diisi `(default)` jika memakai database default,
+   atau isi dengan Database ID spesifik jika memakai multi-database.
+
+--------------------------------------------------------------------------------
+4. SETUP FIREBASE AUTHENTICATION
+--------------------------------------------------------------------------------
+1. Di Firebase Console, buka menu Build -> Authentication -> Get started.
+2. Pada tab "Sign-in method":
+   - Pastikan provider **Google** berstatus **Enabled** (Aktif).
+   - (Opsional) Jika ingin mengaktifkan login Email & Password:
+     * Klik "Add new provider" -> pilih "Email/Password" -> Enable -> Save.
+     * Catatan keamanan: Akun Email/Password WAJIB melakukan verifikasi email
+       (`email_verified == true`) agar diterima oleh Security Rules.
+3. Pada tab "Settings" -> "Authorized domains":
+   - Pastikan `localhost` dan domain produksi Anda (misal `inventory.perusahaan.co.id`)
+     terdaftar pada Authorized domains.
+
+--------------------------------------------------------------------------------
+5. SETUP CLOUD FIRESTORE & STORAGE
+--------------------------------------------------------------------------------
+1. Buka Build -> Firestore Database -> Create database.
+2. Pilih mode Production (karena kita menggunakan aturan keamanan ketat).
+3. Pilih lokasi region terdekat dengan pengguna (misal `asia-southeast2` Jakarta
+   atau `asia-southeast1` Singapore).
+4. (Opsional) Jika memerlukan Firebase Storage untuk lampiran dokumen:
+   - Buka Build -> Storage -> Get started -> pilih region yang sama.
+
+--------------------------------------------------------------------------------
+6. SETUP & DEPLOY FIRESTORE SECURITY RULES
+--------------------------------------------------------------------------------
+Project ini menyertakan file `firestore.rules` yang menerapkan Zero-Trust RBAC:
+- Pembatasan role OWNER, ADMIN (maksimal 1 akun via `/system/adminSlot`),
+  dan PRODUKSI di sisi database.
+- Pencegahan stok negatif (`currentStock >= 0`).
+- Perlindungan transaksi barang masuk yang sudah `CONFIRMED` agar tidak diubah.
+- Pelarangan penghapusan permanen barang yang memiliki histori transaksi.
+- Kartu stok (`/stockLedgers`) dan Audit Log (`/auditLogs`) bersifat permanen
+  (append-only, tidak dapat diedit atau dihapus).
+
+Untuk memvalidasi dan deploy rules dari terminal:
+1. Login ke akun Google Firebase Anda:
+   firebase login
+
+2. Hubungkan folder project dengan project Firebase Anda:
+   firebase use --add
+
+3. Lint security rules sebelum deploy:
+   npx eslint firestore.rules
+
+4. Deploy Firestore Security Rules:
+   firebase deploy --only firestore:rules
+
+--------------------------------------------------------------------------------
+7. PENGATURAN ENVIRONMENT VARIABLES
+--------------------------------------------------------------------------------
+1. Salin `.env.example` menjadi `.env`:
+   cp .env.example .env
+
+2. Jangan pernah menyimpan file `.env`, service account JSON, atau private key
+   di dalam repository Git atau kode frontend.
+3. Pastikan `APP_URL` menggunakan URL `https://...` saat di produksi.
+
+--------------------------------------------------------------------------------
+8. PEMBUATAN AKUN OWNER PERTAMA & MANAJEMEN USER
+--------------------------------------------------------------------------------
+1. Jalankan aplikasi lalu klik "Masuk dengan Google" menggunakan email Owner utama.
+2. Jika sistem belum diinisialisasi (`/system/config` belum ada), layar
+   **Inisialisasi Owner Utama** akan muncul secara otomatis.
+3. Masukkan Nama Perusahaan dan Nama Lengkap Owner, lalu klik
+   "Simpan & Masuk sebagai Owner".
+   Mekanisme ini hanya dapat dijalankan 1 kali dan terkunci di Firestore Rules.
+4. Setelah masuk sebagai OWNER:
+   - Buka menu **Pengguna**.
+   - Klik "Tambah Akun Admin / Produksi".
+   - Masukkan nama, email Google staf, dan pilih role `ADMIN` (maksimal 1 akun
+     aktif, dikunci oleh `/system/adminSlot`) atau `PRODUKSI` (bisa banyak akun).
+   - Staf cukup login menggunakan Google dengan email yang telah diotorisasi
+     tersebut; sistem akan otomatis mengikat akun dan hak aksesnya.
+
+--------------------------------------------------------------------------------
+9. MENJALANKAN APLIKASI SECARA LOKAL
+--------------------------------------------------------------------------------
+1. Jalankan unit test logika inventaris & keamanan terlebih dahulu:
+   npx --yes tsx --test src/domain/rules.test.ts src/domain/reports.test.ts firestore.rules.test.ts
+
+2. Jalankan pemeriksaan tipe TypeScript:
+   npm run lint
+
+3. Jalankan development server (port 3000):
+   npm run dev
+
+4. Buka browser dan akses:
+   http://localhost:3000
+
+--------------------------------------------------------------------------------
+10. BUILD PRODUKSI & DEPLOY KE FIREBASE HOSTING
+--------------------------------------------------------------------------------
+1. Build aplikasi menjadi bundle produksi di folder `dist/`:
+   npm run build
+
+2. Uji hasil build secara lokal sebelum deploy:
+   npm run preview
+
+3. Inisialisasi Firebase Hosting (jika belum ada `firebase.json`):
+   firebase init hosting
+   - Public directory: `dist`
+   - Configure as a single-page app (rewrite all urls to /index.html): `Yes`
+   - Set up automatic builds with GitHub: `No` (atau sesuai kebutuhan)
+   - Overwrite `dist/index.html`: `No`
+
+4. Deploy ke Firebase Hosting (otomatis menyediakan HTTPS!):
+   firebase deploy --only hosting
+
+   Atau deploy sekaligus Hosting dan Firestore Rules:
+   firebase deploy
+
+--------------------------------------------------------------------------------
+11. KONFIGURASI DOMAIN KUSTOM
+--------------------------------------------------------------------------------
+1. Di Firebase Console -> Hosting -> klik "Add custom domain".
+2. Masukkan domain Anda (misal: `inventory.perusahaananda.co.id`).
+3. Tambahkan DNS Record (TXT verifikasi dan A/CNAME record) pada panel DNS
+   penyedia domain Anda (Cloudflare, Niagahoster, Namecheap, dll).
+4. Tunggu hingga sertifikat SSL (HTTPS) berstatus "Connected" (biasanya 15–60 menit).
+5. Tambahkan domain kustom tersebut ke Firebase Authentication -> Settings ->
+   Authorized domains.
+
+--------------------------------------------------------------------------------
+12. PENGGUNAAN MELALUI HP & CARA SCAN BARCODE
+--------------------------------------------------------------------------------
+1. Buka URL HTTPS aplikasi melalui Chrome (Android) atau Safari (iPhone).
+2. Disarankan menambahkan shortcut ke Home Screen ("Add to Home Screen") agar
+   tampil penuh seperti aplikasi mobile.
+3. Untuk melakukan Scan Barcode:
+   - Buka menu **Scan Barcode**.
+   - Klik tombol **Aktifkan Kamera**.
+   - Berikan izin akses kamera saat browser meminta konfirmasi.
+   - Aplikasi akan otomatis memilih kamera belakang (`facingMode: environment`).
+   - Arahkan kamera ke label barcode Code 128 dengan pencahayaan cukup.
+   - Begitu terdeteksi, informasi nama barang, kode, satuan, dan stok saat ini
+     akan langsung tampil dan dapat langsung dimasukkan ke daftar permintaan.
+   - Jika kamera tidak tersedia, gunakan kolom **Pencarian Manual / Scanner USB**.
+4. Untuk mencetak label barcode:
+   - Buka **Master Barang** -> pilih 1 barang atau centang beberapa barang ->
+     klik **Cetak Barcode**.
+   - Pilih layout **Printer Biasa (A4 Grid 3x8)** atau **Printer Label (50x30mm)**
+     lalu unduh PDF siap cetak.
+
+--------------------------------------------------------------------------------
+13. BACKUP DAN RESTORE DATA
+--------------------------------------------------------------------------------
+Backup Harian (Melalui Aplikasi):
+1. Masuk sebagai **OWNER**.
+2. Buka menu **Pengaturan**.
+3. Klik **Unduh Backup Database (.json)** untuk menyimpan arsip lengkap
+   master barang, transaksi masuk/keluar, permintaan, kartu stok, dan audit log.
+
+Backup & Export Cloud Firestore (Melalui gcloud / Firebase Blaze):
+- Jika menggunakan paket Blaze, jadwalkan ekspor Firestore ke Google Cloud Storage:
+  gcloud firestore exports gs://NAMA-BUCKET-BACKUP/firestore-backups/$(date +%Y%m%d)
+
+Restore Data:
+- Restore snapshot Cloud Firestore dari bucket GCS:
+  gcloud firestore import gs://NAMA-BUCKET-BACKUP/firestore-backups/TANGGAL_BACKUP
+
+--------------------------------------------------------------------------------
+14. TROUBLESHOOTING UMUM
+--------------------------------------------------------------------------------
+1. Error "Missing or insufficient permissions":
+   - Pastikan akun sudah login dengan email terverifikasi (`emailVerified: true`).
+   - Pastikan Owner telah menambahkan email tersebut di menu Pengguna, dan
+     `firestore.rules` sudah di-deploy (`firebase deploy --only firestore:rules`).
+
+2. Kamera Barcode Tidak Muncul di HP:
+   - Pastikan website diakses melalui `https://` (bukan `http://` IP lokal).
+   - Periksa pengaturan izin kamera browser untuk situs tersebut.
+
+3. Tidak Bisa Menambah Admin Kedua:
+   - Sistem memang mengunci maksimal 1 akun ADMIN aktif melalui `/system/adminSlot`.
+   - Jika ingin mengganti Admin, nonaktifkan Admin lama atau ubah rolenya
+     menjadi PRODUKSI terlebih dahulu pada menu Pengguna.
+
+4. Barang Tidak Bisa Dihapus:
+   - Sesuai aturan integritas data, barang yang sudah memiliki riwayat transaksi
+     (`hasTransactions = true`) tidak dapat dihapus permanen. Ubah status barang
+     menjadi Nonaktif melalui tombol Edit.
+
+--------------------------------------------------------------------------------
+15. CARA UPDATE APLIKASI
+--------------------------------------------------------------------------------
+1. Ambil pembaruan kode terbaru (jika memakai Git):
+   git pull origin main
+
+2. Perbarui dependency jika ada perubahan pada `package.json`:
+   npm install
+
+3. Jalankan unit test dan build ulang:
+   npx --yes tsx --test src/domain/rules.test.ts src/domain/reports.test.ts firestore.rules.test.ts
+   npm run lint
+   npm run build
+
+4. Deploy pembaruan ke Firebase:
+   firebase deploy
+
+================================================================================
+AKHIR DOKUMEN PANDUAN
+================================================================================

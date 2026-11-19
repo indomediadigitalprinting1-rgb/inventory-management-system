@@ -1,0 +1,10 @@
+{
+  "name": "INVENTORY MANAGEMENT SYSTEM",
+  "description": "Sistem Manajemen Inventaris Multi-Role dengan Barcode Code 128, Permintaan & Penyerahan Barang Bertahap, Kartu Stok Permanen, Audit Log, dan Laporan PDF/Excel.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
