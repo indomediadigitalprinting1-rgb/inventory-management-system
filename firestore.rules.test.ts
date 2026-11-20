@@ -27,9 +27,12 @@ test('firestore.rules enforces global deny, blueprint collection coverage, and D
   // Prevent deletion of items with transaction history
   assert.match(rules, /existing\(\)\.hasTransactions == false/);
 
-  // Max 1 Admin atomic lock
+  // Max 1 Admin atomic lock + invited Admin slot claiming + deactivation release
   assert.match(rules, /\/system\/adminSlot/);
   assert.match(rules, /getAfter\(\/databases\/\$\(database\)\/documents\/system\/adminSlot\)/);
+  assert.match(rules, /function hasActiveAdminInvite\(\)/);
+  assert.match(rules, /hasActiveAdminInvite\(\)[\s\S]*affectedKeys\(\)\.hasOnly\(\['adminUid', 'updatedAt'\]\)/);
+  assert.match(rules, /incoming\(\)\.role != 'ADMIN' \|\|[\s\S]*incoming\(\)\.active == false/);
 
   // Immutable ledgers, deliveries, adjustments, audit logs
   assert.match(rules, /match \/stockLedgers\/\{ledgerId\}/);

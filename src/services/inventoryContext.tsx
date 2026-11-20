@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
   GoogleAuthProvider,
   onAuthStateChanged,
@@ -41,6 +41,7 @@ import {
   canEditMasterItems,
   canManageUnits,
   canManageUsers,
+  CLOSED_TAB_SESSION_TIMEOUT_MS,
   createIncomingReversal,
   emailToInviteId,
   filterVisibleNotifications,
@@ -48,17 +49,25 @@ import {
   getNonOwnerUsers,
   getNotificationReadAt,
   normalizeCodeKey,
+  parseSessionActivity,
   partitionDeletableCategories,
   partitionDeletableItems,
   partitionDeletableSuppliers,
   partitionDeletableUnits,
   processStockDelivery,
   READ_NOTIFICATION_TTL_MS,
+  recordTabClosed,
+  recordTabHeartbeat,
   reviewStockRequest,
   sanitizeId,
+  SESSION_ACTIVITY_STORAGE_KEY,
+  shouldExpireClosedTabSession,
   sortItemsByCode,
   validateAdminSlotAvailability,
+  validateCategoryUniqueness,
   validateItemUniqueness,
+  validateSupplierUniqueness,
+  validateUnitUniqueness,
 } from '../domain/rules';
 import type {
   AdjustmentType,
@@ -171,13 +180,22 @@ export interface InventoryContextValue {
   deleteUserAccount: (user: UserAccount) => Promise<void>;
   deleteUserInvite: (invite: UserInvite) => Promise<void>;
   deleteAllNonOwnerUsers: () => Promise<{ deletedUsers: number; deletedInvites: number }>;
-  saveCategory: (input: { id?: string; code: string; name: string; description: string; active: boolean }) => Promise<Category>;
+  saveCategory: (
+    input: { id?: string; code: string; name: string; description: string; active: boolean },
+    existingOverride?: Category[]
+  ) => Promise<Category>;
   deleteCategory: (category: Category) => Promise<void>;
   deleteCategoriesBatch: (targetCategories: Category[]) => Promise<{ deletedCount: number; skipped: string[] }>;
-  saveUnit: (input: { id?: string; code: string; name: string; description: string; active: boolean }) => Promise<Unit>;
+  saveUnit: (
+    input: { id?: string; code: string; name: string; description: string; active: boolean },
+    existingOverride?: Unit[]
+  ) => Promise<Unit>;
   deleteUnit: (unit: Unit) => Promise<void>;
   deleteUnitsBatch: (targetUnits: Unit[]) => Promise<{ deletedCount: number; skipped: string[] }>;
-  saveSupplier: (input: { id?: string; code: string; name: string; contactPerson: string; phone: string; email: string; address: string; active: boolean }) => Promise<Supplier>;
+  saveSupplier: (
+    input: { id?: string; code: string; name: string; contactPerson: string; phone: string; email: string; address: string; active: boolean },
+    existingOverride?: Supplier[]
+  ) => Promise<Supplier>;
   deleteSupplier: (supplier: Supplier) => Promise<void>;
   deleteSuppliersBatch: (targetSuppliers: Supplier[]) => Promise<{ deletedCount: number; skipped: string[] }>;
   saveItem: (input: {
@@ -262,9 +280,41 @@ function getAutostartRole(): UserRole | null {
   return null;
 }
 
+function readSessionActivityStorage() {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return null;
+    return parseSessionActivity(window.localStorage.getItem(SESSION_ACTIVITY_STORAGE_KEY));
+  } catch {
+    return null;
+  }
+}
+
+function writeSessionActivityStorage(next: ReturnType<typeof recordTabHeartbeat>) {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    window.localStorage.setItem(SESSION_ACTIVITY_STORAGE_KEY, JSON.stringify(next));
+  } catch {
+    // Ignore storage quota or private-mode errors
+  }
+}
+
+function clearSessionActivityStorage() {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    window.localStorage.removeItem(SESSION_ACTIVITY_STORAGE_KEY);
+  } catch {
+    // Ignore storage errors
+  }
+}
+
 export function InventoryProvider({ children }: { children: React.ReactNode }) {
   const autostartRole = useMemo(() => getAutostartRole(), []);
   const isSandbox = autostartRole !== null;
+
+  const sessionTabIdRef = useRef<string>(
+    `tab_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+  );
+  const [activeSessionUid, setActiveSessionUid] = useState<string | null>(null);
 
   const [authStage, setAuthStage] = useState<AuthStage>(isSandbox ? 'READY' : 'LOADING');
   const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
@@ -408,17 +458,18 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
                 if (slot.occupied && slot.adminEmail && slot.adminEmail.toLowerCase() !== email) {
                   throw new Error('Slot ADMIN sudah digunakan oleh pengguna lain.');
                 }
-              }
-              tx.set(
-                slotRef,
-                {
+                tx.update(slotRef, {
+                  adminUid: fbUser.uid,
+                  updatedAt: serverTimestamp(),
+                });
+              } else {
+                tx.set(slotRef, {
                   occupied: true,
                   adminUid: fbUser.uid,
                   adminEmail: email,
                   updatedAt: serverTimestamp(),
-                },
-                { merge: true }
-              );
+                });
+              }
             }
             tx.set(doc(db, 'users', fbUser.uid), {
               uid: fbUser.uid,
@@ -466,17 +517,82 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
     if (isSandbox) return;
     void testConnection();
     const unsub = onAuthStateChanged(auth, (fbUser) => {
-      setFirebaseUser(fbUser);
       if (!fbUser) {
+        setFirebaseUser(null);
+        setActiveSessionUid(null);
         setCurrentUser(null);
         setAuthStage('UNAUTHENTICATED');
         return;
       }
+
+      const snapshot = readSessionActivityStorage();
+      if (
+        shouldExpireClosedTabSession({
+          snapshot,
+          uid: fbUser.uid,
+          nowMs: Date.now(),
+          timeoutMs: CLOSED_TAB_SESSION_TIMEOUT_MS,
+        })
+      ) {
+        clearSessionActivityStorage();
+        setActiveSessionUid(null);
+        setFirebaseUser(null);
+        setCurrentUser(null);
+        setAuthError(
+          'Sesi login otomatis berakhir karena seluruh tab aplikasi telah ditutup lebih dari 5 menit. Silakan masuk kembali.'
+        );
+        setAuthStage('UNAUTHENTICATED');
+        void signOut(auth).catch(() => {});
+        return;
+      }
+
+      writeSessionActivityStorage(
+        recordTabHeartbeat(snapshot, sessionTabIdRef.current, fbUser.uid, Date.now())
+      );
+      setActiveSessionUid(fbUser.uid);
+      setFirebaseUser(fbUser);
       setAuthStage('LOADING');
       void resolveProfile(fbUser);
     });
     return () => unsub();
   }, [isSandbox, resolveProfile]);
+
+  // Track open-tab heartbeats and record closure timestamp when tab/browser closes
+  useEffect(() => {
+    if (isSandbox || !activeSessionUid) return;
+    const tabId = sessionTabIdRef.current;
+
+    const beat = () => {
+      const latest = readSessionActivityStorage();
+      writeSessionActivityStorage(recordTabHeartbeat(latest, tabId, activeSessionUid, Date.now()));
+    };
+
+    const markClosed = () => {
+      const latest = readSessionActivityStorage();
+      writeSessionActivityStorage(recordTabClosed(latest, tabId, activeSessionUid, Date.now()));
+    };
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        beat();
+      }
+    };
+
+    beat();
+    const intervalId = window.setInterval(beat, 15_000);
+    window.addEventListener('focus', beat);
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('pagehide', markClosed);
+    window.addEventListener('beforeunload', markClosed);
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener('focus', beat);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('pagehide', markClosed);
+      window.removeEventListener('beforeunload', markClosed);
+    };
+  }, [activeSessionUid, isSandbox]);
 
   // Attach Firestore real-time listeners when READY
   useEffect(() => {
@@ -652,6 +768,7 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
   // Auth Actions
   const loginWithGoogle = useCallback(async () => {
     setAuthError(null);
+    clearSessionActivityStorage();
     try {
       const provider = new GoogleAuthProvider();
       await signInWithPopup(auth, provider);
@@ -662,6 +779,7 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
 
   const loginWithEmail = useCallback(async (email: string, password: string) => {
     setAuthError(null);
+    clearSessionActivityStorage();
     try {
       await signInWithEmailAndPassword(auth, email.trim(), password);
     } catch (err) {
@@ -679,7 +797,8 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
     const email = firebaseUser.email.toLowerCase();
     await runTransaction(db, async (tx) => {
       const configRef = doc(db, 'system', 'config');
-      const configSnap = await tx.get(configRef);
+      const slotRef = doc(db, 'system', 'adminSlot');
+      const [configSnap, slotSnap] = await Promise.all([tx.get(configRef), tx.get(slotRef)]);
       if (!configSnap.exists()) {
         tx.set(configRef, {
           initialized: true,
@@ -689,12 +808,21 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
           lowStockAlertEnabled: true,
           updatedAt: serverTimestamp(),
         });
-        tx.set(doc(db, 'system', 'adminSlot'), {
-          occupied: false,
-          adminUid: null,
-          adminEmail: null,
-          updatedAt: serverTimestamp(),
-        });
+        if (slotSnap.exists()) {
+          tx.update(slotRef, {
+            occupied: false,
+            adminUid: null,
+            adminEmail: null,
+            updatedAt: serverTimestamp(),
+          });
+        } else {
+          tx.set(slotRef, {
+            occupied: false,
+            adminUid: null,
+            adminEmail: null,
+            updatedAt: serverTimestamp(),
+          });
+        }
       }
       tx.set(doc(db, 'users', firebaseUser.uid), {
         uid: firebaseUser.uid,
@@ -715,6 +843,8 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
       window.location.href = window.location.pathname;
       return;
     }
+    setActiveSessionUid(null);
+    clearSessionActivityStorage();
     if (currentUser) {
       try {
         await writeAuditLogFirestore(currentUser, 'LOGOUT', 'AUTH', currentUser.uid, `${currentUser.name} (${currentUser.role}) keluar dari sistem.`);
@@ -727,37 +857,59 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
 
   const seedStarterMasters = useCallback(async () => {
     if (!currentUser || currentUser.role !== 'OWNER' || isSandbox) return;
-    const batch = writeBatch(db);
     const cats = [
       { id: 'cat_1', code: 'KAT-LGM', name: 'Bahan Baku Logam', description: 'Plat, pipa, dan profil logam' },
       { id: 'cat_2', code: 'KAT-ELK', name: 'Komponen Elektrikal', description: 'Kabel, kontaktor, relay, MCB' },
       { id: 'cat_3', code: 'KAT-KMS', name: 'Kemasan & Konsumabel', description: 'Karton, lakban, APD' },
     ];
-    for (const c of cats) {
-      batch.set(doc(db, 'categories', c.id), { ...c, active: true, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
-    }
     const unitRows = [
       { id: 'unit_1', code: 'PCS', name: 'Pcs', description: 'Satuan per buah' },
       { id: 'unit_2', code: 'LBR', name: 'Lembar', description: 'Satuan lembaran' },
       { id: 'unit_3', code: 'BOX', name: 'Box', description: 'Satuan kotak' },
     ];
-    for (const u of unitRows) {
-      batch.set(doc(db, 'units', u.id), { ...u, active: true, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
-    }
-    batch.set(doc(db, 'suppliers', 'sup_1'), {
-      id: 'sup_1',
-      code: 'SUP-01',
-      name: 'PT Mitra Industri Utama',
-      contactPerson: 'Bagian Penjualan',
-      phone: '021-5550100',
-      email: 'sales@mitraindustri.co.id',
-      address: 'Kawasan Industri Cikarang',
-      active: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
+    const supDocRef = doc(db, 'suppliers', 'sup_1');
+
+    const [catSnaps, unitSnaps, supSnap] = await Promise.all([
+      Promise.all(cats.map((c) => getDoc(doc(db, 'categories', c.id)))),
+      Promise.all(unitRows.map((u) => getDoc(doc(db, 'units', u.id)))),
+      getDoc(supDocRef),
+    ]);
+
+    const batch = writeBatch(db);
+    let writeCount = 0;
+
+    cats.forEach((c, idx) => {
+      if (!catSnaps[idx]?.exists()) {
+        batch.set(doc(db, 'categories', c.id), { ...c, active: true, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
+        writeCount++;
+      }
     });
-    await batch.commit();
-    await writeAuditLogFirestore(currentUser, 'SEED_MASTERS', 'SYSTEM', 'masters', 'Mengisi data awal Kategori, Satuan, dan Supplier.');
+    unitRows.forEach((u, idx) => {
+      if (!unitSnaps[idx]?.exists()) {
+        batch.set(doc(db, 'units', u.id), { ...u, active: true, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
+        writeCount++;
+      }
+    });
+    if (!supSnap.exists()) {
+      batch.set(supDocRef, {
+        id: 'sup_1',
+        code: 'SUP-01',
+        name: 'PT Mitra Industri Utama',
+        contactPerson: 'Bagian Penjualan',
+        phone: '021-5550100',
+        email: 'sales@mitraindustri.co.id',
+        address: 'Kawasan Industri Cikarang',
+        active: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      writeCount++;
+    }
+
+    if (writeCount > 0) {
+      await batch.commit();
+      await writeAuditLogFirestore(currentUser, 'SEED_MASTERS', 'SYSTEM', 'masters', 'Mengisi data awal Kategori, Satuan, dan Supplier.');
+    }
   }, [currentUser, isSandbox, writeAuditLogFirestore]);
 
   // Users & Invites (Max 1 Admin concurrency-safe)
@@ -1229,13 +1381,24 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
 
   // Categories, Units, Suppliers
   const saveCategory = useCallback(
-    async (input: { id?: string; code: string; name: string; description: string; active: boolean }): Promise<Category> => {
+    async (
+      input: { id?: string; code: string; name: string; description: string; active: boolean },
+      existingOverride?: Category[]
+    ): Promise<Category> => {
       if (!currentUser || !canEditMasterItems(currentUser.role)) throw new Error('Akses ditolak.');
+      const uniqueness = validateCategoryUniqueness({
+        code: input.code,
+        name: input.name,
+        editingCategoryId: input.id,
+        existingCategories: existingOverride ?? effectiveCategories,
+      });
+      if (!uniqueness.valid) throw new Error(uniqueness.error);
+
       const id = input.id ?? sanitizeId(`cat_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`);
       const nowIso = new Date().toISOString();
       const saved: Category = {
         id,
-        code: input.code.trim(),
+        code: input.code.trim().toUpperCase(),
         name: input.name.trim(),
         description: input.description.trim(),
         active: input.active,
@@ -1278,17 +1441,28 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
       await writeAuditLogFirestore(currentUser, input.id ? 'UPDATE_CATEGORY' : 'CREATE_CATEGORY', 'CATEGORY', id, `Menyimpan kategori ${saved.name}.`);
       return saved;
     },
-    [appendSandboxAudit, currentUser, isSandbox, writeAuditLogFirestore]
+    [appendSandboxAudit, currentUser, effectiveCategories, isSandbox, writeAuditLogFirestore]
   );
 
   const saveUnit = useCallback(
-    async (input: { id?: string; code: string; name: string; description: string; active: boolean }): Promise<Unit> => {
+    async (
+      input: { id?: string; code: string; name: string; description: string; active: boolean },
+      existingOverride?: Unit[]
+    ): Promise<Unit> => {
       if (!currentUser || !canManageUnits(currentUser.role)) throw new Error('Hanya OWNER yang dapat mengelola satuan.');
+      const uniqueness = validateUnitUniqueness({
+        code: input.code,
+        name: input.name,
+        editingUnitId: input.id,
+        existingUnits: existingOverride ?? effectiveUnits,
+      });
+      if (!uniqueness.valid) throw new Error(uniqueness.error);
+
       const id = input.id ?? sanitizeId(`unit_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`);
       const nowIso = new Date().toISOString();
       const saved: Unit = {
         id,
-        code: input.code.trim(),
+        code: input.code.trim().toUpperCase(),
         name: input.name.trim(),
         description: input.description.trim(),
         active: input.active,
@@ -1331,17 +1505,28 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
       await writeAuditLogFirestore(currentUser, input.id ? 'UPDATE_UNIT' : 'CREATE_UNIT', 'UNIT', id, `Menyimpan satuan ${saved.name}.`);
       return saved;
     },
-    [appendSandboxAudit, currentUser, isSandbox, writeAuditLogFirestore]
+    [appendSandboxAudit, currentUser, effectiveUnits, isSandbox, writeAuditLogFirestore]
   );
 
   const saveSupplier = useCallback(
-    async (input: { id?: string; code: string; name: string; contactPerson: string; phone: string; email: string; address: string; active: boolean }): Promise<Supplier> => {
+    async (
+      input: { id?: string; code: string; name: string; contactPerson: string; phone: string; email: string; address: string; active: boolean },
+      existingOverride?: Supplier[]
+    ): Promise<Supplier> => {
       if (!currentUser || !canEditMasterItems(currentUser.role)) throw new Error('Akses ditolak.');
+      const uniqueness = validateSupplierUniqueness({
+        code: input.code,
+        name: input.name,
+        editingSupplierId: input.id,
+        existingSuppliers: existingOverride ?? effectiveSuppliers,
+      });
+      if (!uniqueness.valid) throw new Error(uniqueness.error);
+
       const id = input.id ?? sanitizeId(`sup_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`);
       const nowIso = new Date().toISOString();
       const saved: Supplier = {
         id,
-        code: input.code.trim(),
+        code: input.code.trim().toUpperCase(),
         name: input.name.trim(),
         contactPerson: input.contactPerson.trim(),
         phone: input.phone.trim(),
@@ -1393,7 +1578,7 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
       await writeAuditLogFirestore(currentUser, input.id ? 'UPDATE_SUPPLIER' : 'CREATE_SUPPLIER', 'SUPPLIER', id, `Menyimpan supplier ${saved.name}.`);
       return saved;
     },
-    [appendSandboxAudit, currentUser, isSandbox, writeAuditLogFirestore]
+    [appendSandboxAudit, currentUser, effectiveSuppliers, isSandbox, writeAuditLogFirestore]
   );
 
   const deleteCategory = useCallback(
@@ -1694,6 +1879,8 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
       const uniqueness = validateItemUniqueness({
         code: input.code,
         barcode: input.barcode,
+        name: input.name,
+        specification: input.specification,
         editingItemId: input.id,
         existingItems: existingItemsList,
       });
@@ -1966,25 +2153,31 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
               existing.description !== cleanDesc ||
               existing.active !== catRow.active;
             if (changed) {
-              const updated = await saveCategory({
-                id: existing.id,
-                code: targetCode,
-                name: cleanName,
-                description: cleanDesc,
-                active: catRow.active,
-              });
+              const updated = await saveCategory(
+                {
+                  id: existing.id,
+                  code: targetCode,
+                  name: cleanName,
+                  description: cleanDesc,
+                  active: catRow.active,
+                },
+                workingCategories
+              );
               workingCategories = workingCategories.map((c) => (c.id === existing.id ? updated : c));
               summary.categoriesUpdated++;
             }
           } else {
             const finalCode =
               cleanCode || generateSequentialMasterCode('KAT', workingCategories.map((c) => c.code));
-            const created = await saveCategory({
-              code: finalCode,
-              name: cleanName,
-              description: cleanDesc,
-              active: catRow.active,
-            });
+            const created = await saveCategory(
+              {
+                code: finalCode,
+                name: cleanName,
+                description: cleanDesc,
+                active: catRow.active,
+              },
+              workingCategories
+            );
             workingCategories = [created, ...workingCategories];
             summary.categoriesCreated++;
           }
@@ -2015,13 +2208,16 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
                 summary.skipped.push(`Satuan "${cleanName}": hanya OWNER yang dapat mengubah data satuan.`);
                 continue;
               }
-              const updated = await saveUnit({
-                id: existing.id,
-                code: targetCode,
-                name: cleanName,
-                description: cleanDesc,
-                active: unitRow.active,
-              });
+              const updated = await saveUnit(
+                {
+                  id: existing.id,
+                  code: targetCode,
+                  name: cleanName,
+                  description: cleanDesc,
+                  active: unitRow.active,
+                },
+                workingUnits
+              );
               workingUnits = workingUnits.map((u) => (u.id === existing.id ? updated : u));
               summary.unitsUpdated++;
             }
@@ -2032,12 +2228,15 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
             }
             const finalCode =
               cleanCode || generateUnitCodeFromName(cleanName, workingUnits.map((u) => u.code));
-            const created = await saveUnit({
-              code: finalCode,
-              name: cleanName,
-              description: cleanDesc,
-              active: unitRow.active,
-            });
+            const created = await saveUnit(
+              {
+                code: finalCode,
+                name: cleanName,
+                description: cleanDesc,
+                active: unitRow.active,
+              },
+              workingUnits
+            );
             workingUnits = [created, ...workingUnits];
             summary.unitsCreated++;
           }
@@ -2070,31 +2269,37 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
               existing.address !== cleanAddress ||
               existing.active !== supRow.active;
             if (changed) {
-              const updated = await saveSupplier({
-                id: existing.id,
-                code: targetCode,
-                name: cleanName,
-                contactPerson: cleanPic,
-                phone: cleanPhone,
-                email: cleanEmail,
-                address: cleanAddress,
-                active: supRow.active,
-              });
+              const updated = await saveSupplier(
+                {
+                  id: existing.id,
+                  code: targetCode,
+                  name: cleanName,
+                  contactPerson: cleanPic,
+                  phone: cleanPhone,
+                  email: cleanEmail,
+                  address: cleanAddress,
+                  active: supRow.active,
+                },
+                workingSuppliers
+              );
               workingSuppliers = workingSuppliers.map((s) => (s.id === existing.id ? updated : s));
               summary.suppliersUpdated++;
             }
           } else {
             const finalCode =
               cleanCode || generateSequentialMasterCode('SUP', workingSuppliers.map((s) => s.code));
-            const created = await saveSupplier({
-              code: finalCode,
-              name: cleanName,
-              contactPerson: cleanPic,
-              phone: cleanPhone,
-              email: cleanEmail,
-              address: cleanAddress,
-              active: supRow.active,
-            });
+            const created = await saveSupplier(
+              {
+                code: finalCode,
+                name: cleanName,
+                contactPerson: cleanPic,
+                phone: cleanPhone,
+                email: cleanEmail,
+                address: cleanAddress,
+                active: supRow.active,
+              },
+              workingSuppliers
+            );
             workingSuppliers = [created, ...workingSuppliers];
             summary.suppliersCreated++;
           }
@@ -2120,12 +2325,15 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
               const newCatCode =
                 row.categoryCode.trim().toUpperCase().slice(0, 32) ||
                 generateSequentialMasterCode('KAT', workingCategories.map((c) => c.code));
-              cat = await saveCategory({
-                code: newCatCode,
-                name: newCatName,
-                description: '',
-                active: true,
-              });
+              cat = await saveCategory(
+                {
+                  code: newCatCode,
+                  name: newCatName,
+                  description: '',
+                  active: true,
+                },
+                workingCategories
+              );
               workingCategories = [cat, ...workingCategories];
               summary.categoriesCreated++;
             }
@@ -2147,12 +2355,15 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
               const newUnitCode =
                 row.unitCode.trim().toUpperCase().slice(0, 24) ||
                 generateUnitCodeFromName(newUnitName, workingUnits.map((u) => u.code));
-              unit = await saveUnit({
-                code: newUnitCode,
-                name: newUnitName,
-                description: '',
-                active: true,
-              });
+              unit = await saveUnit(
+                {
+                  code: newUnitCode,
+                  name: newUnitName,
+                  description: '',
+                  active: true,
+                },
+                workingUnits
+              );
               workingUnits = [unit, ...workingUnits];
               summary.unitsCreated++;
             }
@@ -2168,15 +2379,18 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
               const newSupCode =
                 row.supplierCode.trim().toUpperCase().slice(0, 32) ||
                 generateSequentialMasterCode('SUP', workingSuppliers.map((s) => s.code));
-              sup = await saveSupplier({
-                code: newSupCode,
-                name: newSupName,
-                contactPerson: '',
-                phone: '',
-                email: '',
-                address: '',
-                active: true,
-              });
+              sup = await saveSupplier(
+                {
+                  code: newSupCode,
+                  name: newSupName,
+                  contactPerson: '',
+                  phone: '',
+                  email: '',
+                  address: '',
+                  active: true,
+                },
+                workingSuppliers
+              );
               workingSuppliers = [sup, ...workingSuppliers];
               summary.suppliersCreated++;
             }
@@ -2624,6 +2838,7 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
         tx.update(origRef, { status: 'REVERSED', updatedAt: serverTimestamp() });
         tx.set(doc(db, 'incomingTransactions', reversalId), {
           ...res.reversalTx,
+          notes: res.reversalTx.notes.slice(0, 500),
           confirmedAt: serverTimestamp(),
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
@@ -2636,7 +2851,11 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
           });
         }
         for (const led of res.ledgerEntries) {
-          tx.set(doc(db, 'stockLedgers', led.id), { ...led, createdAt: serverTimestamp() });
+          tx.set(doc(db, 'stockLedgers', led.id), {
+            ...led,
+            notes: led.notes.slice(0, 500),
+            createdAt: serverTimestamp(),
+          });
         }
       });
 
@@ -2750,14 +2969,16 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
         targetRole: 'PRODUKSI',
         targetUid: input.request.requesterUid,
         type: input.decision === 'APPROVE' ? 'REQUEST_APPROVED' : 'REQUEST_REJECTED',
-        title:
+        title: (
           input.decision === 'APPROVE'
             ? `Permintaan ${input.request.requestNumber} Disetujui`
-            : `Permintaan ${input.request.requestNumber} Ditolak`,
-        message:
+            : `Permintaan ${input.request.requestNumber} Ditolak`
+        ).slice(0, 140),
+        message: (
           input.decision === 'APPROVE'
             ? `Disetujui oleh ${currentUser.name} dan siap diambil di gudang.`
-            : `Ditolak: ${input.rejectionReason}`,
+            : `Ditolak: ${input.rejectionReason}`
+        ).slice(0, 400),
         linkView: 'history',
         relatedId: input.request.id,
         readBy: [],
@@ -3000,8 +3221,8 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
               targetRole: 'OWNER',
               targetUid: null,
               type: 'LOW_STOCK',
-              title: item.currentStock <= 0 ? `Stok Habis: ${item.name}` : `Stok Minimum: ${item.name}`,
-              message: `Sisa stok ${item.currentStock} ${item.unitName} (Min: ${item.minStock}).`,
+              title: (item.currentStock <= 0 ? `Stok Habis: ${item.name}` : `Stok Minimum: ${item.name}`).slice(0, 140),
+              message: `Sisa stok ${item.currentStock} ${item.unitName} (Min: ${item.minStock}).`.slice(0, 400),
               linkView: 'items',
               relatedId: item.id,
               readBy: [],
@@ -3012,6 +3233,7 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
         for (const led of res.ledgerEntries) {
           tx.set(doc(db, 'stockLedgers', led.id), {
             ...led,
+            notes: led.notes.slice(0, 500),
             createdAt: serverTimestamp(),
           });
         }
@@ -3021,8 +3243,8 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
           targetRole: 'PRODUKSI',
           targetUid: latestReq.requesterUid,
           type: 'DELIVERY_CONFIRMED',
-          title: `Penyerahan ${deliveryNumber}`,
-          message: `Barang untuk ${latestReq.requestNumber} telah diserahkan (${res.updatedRequest.status}).`,
+          title: `Penyerahan ${deliveryNumber}`.slice(0, 140),
+          message: `Barang untuk ${latestReq.requestNumber} telah diserahkan (${res.updatedRequest.status}).`.slice(0, 400),
           linkView: 'history',
           relatedId: latestReq.id,
           readBy: [],

@@ -192,7 +192,7 @@ export function MasterItemsPage() {
     if (type === 'category') {
       setQuickCode(generateNextSequentialCode('KAT', categories.map((c) => c.code), 2));
     } else if (type === 'unit') {
-      setQuickCode('');
+      setQuickCode(generateNextSequentialCode('SAT', units.map((u) => u.code), 2));
     } else {
       setQuickCode(generateNextSequentialCode('SUP', suppliers.map((s) => s.code), 2));
     }
@@ -689,7 +689,14 @@ export function MasterItemsPage() {
               <h2 className="font-display text-lg font-bold text-slate-900">
                 {modalMode === 'create' ? 'Tambah Master Barang Baru' : `Edit Barang: ${selectedItem?.code}`}
               </h2>
-              <button type="button" aria-label="Tutup modal" onClick={() => setModalMode(null)}>
+              <button
+                type="button"
+                aria-label="Tutup modal"
+                onClick={() => {
+                  if (feedback?.type === 'err') setFeedback(null);
+                  setModalMode(null);
+                }}
+              >
                 <X className="w-5 h-5 text-slate-500" />
               </button>
             </div>
@@ -704,14 +711,15 @@ export function MasterItemsPage() {
               <div className="grid sm:grid-cols-2 gap-4">
                 <div>
                   <label htmlFor="item-code" className="block text-xs font-medium text-slate-700 mb-1">
-                    Kode Barang (Unik)
+                    Kode Barang (Otomatis)
                   </label>
                   <input
                     id="item-code"
                     required
+                    readOnly
+                    disabled
                     value={code}
-                    onChange={(e) => setCode(e.target.value)}
-                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg font-mono"
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg font-mono bg-slate-100 text-slate-600 cursor-not-allowed"
                   />
                 </div>
                 <div>
@@ -807,15 +815,15 @@ export function MasterItemsPage() {
                   <div className="grid sm:grid-cols-3 gap-2.5">
                     <div>
                       <label htmlFor="quick-cat-code" className="block text-[11px] font-medium text-slate-600 mb-1">
-                        Kode Kategori
+                        Kode Kategori (Otomatis)
                       </label>
                       <input
                         id="quick-cat-code"
                         maxLength={32}
+                        readOnly
+                        disabled
                         value={quickCode}
-                        onChange={(e) => setQuickCode(e.target.value)}
-                        placeholder="KAT-01"
-                        className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-white font-mono"
+                        className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-slate-100 text-slate-600 font-mono cursor-not-allowed"
                       />
                     </div>
                     <div>
@@ -966,15 +974,15 @@ export function MasterItemsPage() {
                   <div className="grid sm:grid-cols-3 gap-2.5">
                     <div>
                       <label htmlFor="quick-unit-code" className="block text-[11px] font-medium text-slate-600 mb-1">
-                        Kode Satuan
+                        Kode Satuan (Otomatis)
                       </label>
                       <input
                         id="quick-unit-code"
                         maxLength={24}
+                        readOnly
+                        disabled
                         value={quickCode}
-                        onChange={(e) => setQuickCode(e.target.value)}
-                        placeholder="PCS / BOX / KG"
-                        className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-white font-mono"
+                        className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-slate-100 text-slate-600 font-mono cursor-not-allowed"
                       />
                     </div>
                     <div>
@@ -1077,15 +1085,15 @@ export function MasterItemsPage() {
                   <div className="grid sm:grid-cols-2 gap-2.5">
                     <div>
                       <label htmlFor="quick-sup-code" className="block text-[11px] font-medium text-slate-600 mb-1">
-                        Kode Supplier
+                        Kode Supplier (Otomatis)
                       </label>
                       <input
                         id="quick-sup-code"
                         maxLength={32}
+                        readOnly
+                        disabled
                         value={quickCode}
-                        onChange={(e) => setQuickCode(e.target.value)}
-                        placeholder="SUP-01"
-                        className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-white font-mono"
+                        className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-slate-100 text-slate-600 font-mono cursor-not-allowed"
                       />
                     </div>
                     <div>
@@ -1144,7 +1152,10 @@ export function MasterItemsPage() {
               <div className="pt-3 border-t border-slate-200 flex justify-end gap-3">
                 <button
                   type="button"
-                  onClick={() => setModalMode(null)}
+                  onClick={() => {
+                    if (feedback?.type === 'err') setFeedback(null);
+                    setModalMode(null);
+                  }}
                   className="px-4 py-2 border border-slate-300 text-slate-700 text-sm font-medium rounded-lg hover:bg-slate-50"
                 >
                   Batal

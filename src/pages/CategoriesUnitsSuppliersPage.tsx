@@ -125,6 +125,7 @@ export function CategoriesPage() {
   const [description, setDescription] = useState('');
   const [active, setActive] = useState(true);
   const [feedback, setFeedback] = useState<FeedbackState | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
 
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
@@ -158,17 +159,19 @@ export function CategoriesPage() {
     setDescription('');
     setActive(true);
     setFeedback(null);
+    setFormError(null);
     setShowForm(true);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setFormError(null);
     try {
       await saveCategory({ id: editingId ?? undefined, code, name, description, active });
       setShowForm(false);
-      setFeedback({ type: 'ok', text: `Kategori "${name}" berhasil disimpan.` });
+      setFeedback({ type: 'ok', text: `Kategori "${name.trim()}" berhasil disimpan.` });
     } catch (err) {
-      setFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Gagal menyimpan kategori.' });
+      setFormError(err instanceof Error ? err.message : 'Gagal menyimpan kategori.');
     }
   };
 
@@ -326,6 +329,7 @@ export function CategoriesPage() {
                             setName(c.name);
                             setDescription(c.description);
                             setActive(c.active);
+                            setFormError(null);
                             setShowForm(true);
                           }}
                           className="p-1.5 text-slate-600 hover:text-amber-700 hover:bg-amber-50 rounded"
@@ -359,14 +363,35 @@ export function CategoriesPage() {
               <h2 className="font-display text-base font-bold text-slate-900">
                 {editingId ? 'Edit Kategori' : 'Tambah Kategori'}
               </h2>
-              <button type="button" aria-label="Tutup form" onClick={() => setShowForm(false)}>
+              <button
+                type="button"
+                aria-label="Tutup form"
+                onClick={() => {
+                  setFormError(null);
+                  setShowForm(false);
+                }}
+              >
                 <X className="w-5 h-5 text-slate-500" />
               </button>
             </div>
+            {formError && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-800">
+                {formError}
+              </div>
+            )}
             <form onSubmit={handleSubmit} className="space-y-3">
               <div>
-                <label htmlFor="cat-code" className="block text-xs font-medium text-slate-700 mb-1">Kode</label>
-                <input id="cat-code" required value={code} onChange={(e) => setCode(e.target.value)} className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg font-mono" />
+                <label htmlFor="cat-code" className="block text-xs font-medium text-slate-700 mb-1">
+                  Kode Kategori (Otomatis)
+                </label>
+                <input
+                  id="cat-code"
+                  required
+                  readOnly
+                  disabled
+                  value={code}
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg font-mono bg-slate-100 text-slate-600 cursor-not-allowed"
+                />
               </div>
               <div>
                 <label htmlFor="cat-name" className="block text-xs font-medium text-slate-700 mb-1">Nama Kategori</label>
@@ -381,7 +406,16 @@ export function CategoriesPage() {
                 Aktif
               </label>
               <div className="pt-2 flex justify-end gap-2">
-                <button type="button" onClick={() => setShowForm(false)} className="px-4 py-2 border border-slate-300 text-sm rounded-lg">Batal</button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setFormError(null);
+                    setShowForm(false);
+                  }}
+                  className="px-4 py-2 border border-slate-300 text-sm rounded-lg"
+                >
+                  Batal
+                </button>
                 <button type="submit" className="px-4 py-2 bg-red-800 text-white text-sm font-medium rounded-lg">Simpan</button>
               </div>
             </form>
@@ -413,6 +447,7 @@ export function UnitsPage() {
   const [description, setDescription] = useState('');
   const [active, setActive] = useState(true);
   const [feedback, setFeedback] = useState<FeedbackState | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
 
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
@@ -441,22 +476,24 @@ export function UnitsPage() {
 
   const openNew = () => {
     setEditingId(null);
-    setCode('');
+    setCode(generateNextSequentialCode('SAT', units.map((u) => u.code), 2));
     setName('');
     setDescription('');
     setActive(true);
     setFeedback(null);
+    setFormError(null);
     setShowForm(true);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setFormError(null);
     try {
       await saveUnit({ id: editingId ?? undefined, code, name, description, active });
       setShowForm(false);
-      setFeedback({ type: 'ok', text: `Satuan "${name}" berhasil disimpan.` });
+      setFeedback({ type: 'ok', text: `Satuan "${name.trim()}" berhasil disimpan.` });
     } catch (err) {
-      setFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Gagal menyimpan satuan.' });
+      setFormError(err instanceof Error ? err.message : 'Gagal menyimpan satuan.');
     }
   };
 
@@ -614,6 +651,7 @@ export function UnitsPage() {
                             setName(u.name);
                             setDescription(u.description);
                             setActive(u.active);
+                            setFormError(null);
                             setShowForm(true);
                           }}
                           className="p-1.5 text-slate-600 hover:text-amber-700 hover:bg-amber-50 rounded"
@@ -647,14 +685,35 @@ export function UnitsPage() {
               <h2 className="font-display text-base font-bold text-slate-900">
                 {editingId ? 'Edit Satuan' : 'Tambah Satuan'}
               </h2>
-              <button type="button" aria-label="Tutup modal satuan" onClick={() => setShowForm(false)}>
+              <button
+                type="button"
+                aria-label="Tutup modal satuan"
+                onClick={() => {
+                  setFormError(null);
+                  setShowForm(false);
+                }}
+              >
                 <X className="w-5 h-5 text-slate-500" />
               </button>
             </div>
+            {formError && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-800">
+                {formError}
+              </div>
+            )}
             <form onSubmit={handleSubmit} className="space-y-3">
               <div>
-                <label htmlFor="unit-code" className="block text-xs font-medium text-slate-700 mb-1">Kode</label>
-                <input id="unit-code" required value={code} onChange={(e) => setCode(e.target.value)} className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg font-mono" />
+                <label htmlFor="unit-code" className="block text-xs font-medium text-slate-700 mb-1">
+                  Kode Satuan (Otomatis)
+                </label>
+                <input
+                  id="unit-code"
+                  required
+                  readOnly
+                  disabled
+                  value={code}
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg font-mono bg-slate-100 text-slate-600 cursor-not-allowed"
+                />
               </div>
               <div>
                 <label htmlFor="unit-name" className="block text-xs font-medium text-slate-700 mb-1">Nama Satuan</label>
@@ -669,7 +728,16 @@ export function UnitsPage() {
                 Aktif
               </label>
               <div className="pt-2 flex justify-end gap-2">
-                <button type="button" onClick={() => setShowForm(false)} className="px-4 py-2 border border-slate-300 text-sm rounded-lg">Batal</button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setFormError(null);
+                    setShowForm(false);
+                  }}
+                  className="px-4 py-2 border border-slate-300 text-sm rounded-lg"
+                >
+                  Batal
+                </button>
                 <button type="submit" className="px-4 py-2 bg-red-800 text-white text-sm font-medium rounded-lg">Simpan</button>
               </div>
             </form>
@@ -712,6 +780,7 @@ export function SuppliersPage() {
   const [address, setAddress] = useState('');
   const [active, setActive] = useState(true);
   const [feedback, setFeedback] = useState<FeedbackState | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
 
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
@@ -748,17 +817,19 @@ export function SuppliersPage() {
     setAddress('');
     setActive(true);
     setFeedback(null);
+    setFormError(null);
     setShowForm(true);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setFormError(null);
     try {
       await saveSupplier({ id: editingId ?? undefined, code, name, contactPerson, phone, email, address, active });
       setShowForm(false);
-      setFeedback({ type: 'ok', text: `Supplier "${name}" berhasil disimpan.` });
+      setFeedback({ type: 'ok', text: `Supplier "${name.trim()}" berhasil disimpan.` });
     } catch (err) {
-      setFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Gagal menyimpan supplier.' });
+      setFormError(err instanceof Error ? err.message : 'Gagal menyimpan supplier.');
     }
   };
 
@@ -924,6 +995,7 @@ export function SuppliersPage() {
                             setEmail(s.email);
                             setAddress(s.address);
                             setActive(s.active);
+                            setFormError(null);
                             setShowForm(true);
                           }}
                           className="p-1.5 text-slate-600 hover:text-amber-700 hover:bg-amber-50 rounded"
@@ -957,15 +1029,36 @@ export function SuppliersPage() {
               <h2 className="font-display text-base font-bold text-slate-900">
                 {editingId ? 'Edit Supplier' : 'Tambah Supplier'}
               </h2>
-              <button type="button" aria-label="Tutup modal supplier" onClick={() => setShowForm(false)}>
+              <button
+                type="button"
+                aria-label="Tutup modal supplier"
+                onClick={() => {
+                  setFormError(null);
+                  setShowForm(false);
+                }}
+              >
                 <X className="w-5 h-5 text-slate-500" />
               </button>
             </div>
+            {formError && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-800">
+                {formError}
+              </div>
+            )}
             <form onSubmit={handleSubmit} className="space-y-3">
               <div className="grid sm:grid-cols-2 gap-3">
                 <div>
-                  <label htmlFor="sup-code" className="block text-xs font-medium text-slate-700 mb-1">Kode</label>
-                  <input id="sup-code" required value={code} onChange={(e) => setCode(e.target.value)} className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg font-mono" />
+                  <label htmlFor="sup-code" className="block text-xs font-medium text-slate-700 mb-1">
+                    Kode Supplier (Otomatis)
+                  </label>
+                  <input
+                    id="sup-code"
+                    required
+                    readOnly
+                    disabled
+                    value={code}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg font-mono bg-slate-100 text-slate-600 cursor-not-allowed"
+                  />
                 </div>
                 <div>
                   <label htmlFor="sup-name" className="block text-xs font-medium text-slate-700 mb-1">Nama Supplier</label>
@@ -995,7 +1088,16 @@ export function SuppliersPage() {
                 Aktif
               </label>
               <div className="pt-2 flex justify-end gap-2">
-                <button type="button" onClick={() => setShowForm(false)} className="px-4 py-2 border border-slate-300 text-sm rounded-lg">Batal</button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setFormError(null);
+                    setShowForm(false);
+                  }}
+                  className="px-4 py-2 border border-slate-300 text-sm rounded-lg"
+                >
+                  Batal
+                </button>
                 <button type="submit" className="px-4 py-2 bg-red-800 text-white text-sm font-medium rounded-lg">Simpan</button>
               </div>
             </form>

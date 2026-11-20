@@ -10,22 +10,30 @@ import {
   canDeleteNotification,
   canDeleteSupplier,
   canDeleteUnit,
+  CLOSED_TAB_SESSION_TIMEOUT_MS,
   createIncomingReversal,
   filterVisibleNotifications,
   generateNextSequentialCode,
   getNonOwnerUsers,
   getRemainingReadMinutes,
   isNotificationExpired,
+  parseSessionActivity,
   partitionDeletableCategories,
   partitionDeletableItems,
   partitionDeletableSuppliers,
   partitionDeletableUnits,
   processStockDelivery,
   READ_NOTIFICATION_TTL_MS,
+  recordTabClosed,
+  recordTabHeartbeat,
   reviewStockRequest,
+  shouldExpireClosedTabSession,
   sortItemsByCode,
   validateAdminSlotAvailability,
+  validateCategoryUniqueness,
   validateItemUniqueness,
+  validateSupplierUniqueness,
+  validateUnitUniqueness,
 } from './rules';
 import type {
   IncomingTransaction,
@@ -634,4 +642,174 @@ test('Category, unit, and supplier deletion guards enforce OWNER role and block 
   assert.deepEqual(supSplit.deletable.map((s) => s.id), ['sup_free']);
   assert.deepEqual(supSplit.locked.map((s) => s.id), ['sup_item', 'sup_tx']);
 });
+
+test('Closed-tab session expires 5 minutes after last browser tab closes or PC shuts down', () => {
+  const uid = 'owner_1';
+  const t0 = 1_700_000_000_000;
+
+  // Fresh login (no prior snapshot) does not expire
+  assert.equal(shouldExpireClosedTabSession({ snapshot: null, uid, nowMs: t0 }), false);
+
+  // Tab 1 and Tab 2 open
+  let state = recordTabHeartbeat(null, 'tab_1', uid, t0);
+  state = recordTabHeartbeat(state, 'tab_2', uid, t0 + 30_000);
+  assert.equal(state.lastClosedAt, null);
+  assert.equal(Object.keys(state.openTabs).length, 2);
+
+  // Closing Tab 1 while Tab 2 is still alive keeps session active
+  state = recordTabClosed(state, 'tab_1', uid, t0 + 60_000);
+  assert.equal(state.lastClosedAt, null);
+  assert.equal(
+    shouldExpireClosedTabSession({ snapshot: state, uid, nowMs: t0 + 90_000 }),
+    false
+  );
+
+  // Closing the final Tab 2 records lastClosedAt
+  const closedAt = t0 + 120_000;
+  state = recordTabClosed(state, 'tab_2', uid, closedAt);
+  assert.equal(state.lastClosedAt, closedAt);
+  assert.deepEqual(state.openTabs, {});
+
+  // Reopening within < 5 minutes (e.g. 4m59s) keeps session valid
+  assert.equal(
+    shouldExpireClosedTabSession({
+      snapshot: state,
+      uid,
+      nowMs: closedAt + CLOSED_TAB_SESSION_TIMEOUT_MS - 1_000,
+    }),
+    false
+  );
+
+  // Reopening at >= 5 minutes expires session automatically
+  assert.equal(
+    shouldExpireClosedTabSession({
+      snapshot: state,
+      uid,
+      nowMs: closedAt + CLOSED_TAB_SESSION_TIMEOUT_MS,
+    }),
+    true
+  );
+
+  // Abrupt PC power-off without pagehide: stale open tab heartbeat expires after 5 minutes
+  const crashedState = recordTabHeartbeat(null, 'tab_crash', uid, t0);
+  assert.equal(
+    shouldExpireClosedTabSession({
+      snapshot: crashedState,
+      uid,
+      nowMs: t0 + CLOSED_TAB_SESSION_TIMEOUT_MS,
+    }),
+    true
+  );
+
+  // Snapshot belonging to a different UID never locks out another user signing in
+  assert.equal(
+    shouldExpireClosedTabSession({
+      snapshot: state,
+      uid: 'other_user',
+      nowMs: closedAt + CLOSED_TAB_SESSION_TIMEOUT_MS + 60_000,
+    }),
+    false
+  );
+
+  // Serialization round-trip safety
+  const serialized = JSON.stringify(state);
+  assert.deepEqual(parseSessionActivity(serialized), state);
+  assert.equal(parseSessionActivity('not-json'), null);
+});
+
+test('Duplicate name checks block same-name supplier, unit, category, and same name+specification item even with different codes', () => {
+  // 1. Supplier name uniqueness (different code, same name)
+  const suppliers = [{ id: 'sup_1', code: 'SUP-01', name: 'PT Baja Mandiri Tbk' }];
+  assert.equal(
+    validateSupplierUniqueness({
+      code: 'SUP-02',
+      name: '  pt baja   mandiri tbk ',
+      existingSuppliers: suppliers,
+    }).valid,
+    false
+  );
+  assert.equal(
+    validateSupplierUniqueness({
+      code: 'SUP-01',
+      name: 'PT Baja Mandiri Tbk',
+      editingSupplierId: 'sup_1',
+      existingSuppliers: suppliers,
+    }).valid,
+    true
+  );
+
+  // 2. Unit name uniqueness (different code, same name)
+  const units = [{ id: 'u_1', code: 'SAT-01', name: 'Pcs' }];
+  assert.equal(
+    validateUnitUniqueness({
+      code: 'SAT-02',
+      name: 'pcs',
+      existingUnits: units,
+    }).valid,
+    false
+  );
+  assert.equal(
+    validateUnitUniqueness({
+      code: 'SAT-02',
+      name: 'Lusin',
+      existingUnits: units,
+    }).valid,
+    true
+  );
+
+  // 3. Category name uniqueness (different code, same name)
+  const categories = [{ id: 'c_1', code: 'KAT-01', name: 'Bahan Baku Logam' }];
+  assert.equal(
+    validateCategoryUniqueness({
+      code: 'KAT-02',
+      name: 'bahan baku logam',
+      existingCategories: categories,
+    }).valid,
+    false
+  );
+
+  // 4. Item: same name + same specification is blocked; same name + different specification is allowed
+  const existingItems = [
+    makeItem({
+      id: 'item_1',
+      code: 'BRG-001',
+      barcode: 'IMS-100001',
+      name: 'Plat Baja Galvanis',
+      specification: '2mm x 1200mm',
+    }),
+  ];
+  assert.equal(
+    validateItemUniqueness({
+      code: 'BRG-002',
+      barcode: 'IMS-100002',
+      name: 'plat baja   galvanis',
+      specification: '2MM x 1200MM',
+      existingItems,
+    }).valid,
+    false
+  );
+  assert.equal(
+    validateItemUniqueness({
+      code: 'BRG-002',
+      barcode: 'IMS-100002',
+      name: 'Plat Baja Galvanis',
+      specification: '3mm x 1200mm',
+      existingItems,
+    }).valid,
+    true
+  );
+  assert.equal(
+    validateItemUniqueness({
+      code: 'BRG-001',
+      barcode: 'IMS-100001',
+      name: 'Plat Baja Galvanis',
+      specification: '2mm x 1200mm',
+      editingItemId: 'item_1',
+      existingItems,
+    }).valid,
+    true
+  );
+});
+
+
 

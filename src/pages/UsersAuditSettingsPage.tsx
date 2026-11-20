@@ -692,6 +692,13 @@ export function SettingsPage() {
           </form>
 
           <div className="pt-4 border-t border-slate-200 space-y-2">
+            <h3 className="text-xs font-semibold text-slate-800">Keamanan Sesi Otomatis</h3>
+            <p className="text-xs text-slate-500">
+              Demi keamanan internal, sesi akun otomatis logout apabila seluruh tab browser aplikasi ditutup lebih dari <span className="font-semibold text-slate-700">5 menit</span>.
+            </p>
+          </div>
+
+          <div className="pt-4 border-t border-slate-200 space-y-2">
             <h3 className="text-xs font-semibold text-slate-800">Backup Data Operasional</h3>
             <p className="text-xs text-slate-500">
               Unduh salinan lengkap master data, transaksi, kartu stok, dan audit log dalam format JSON terstruktur.

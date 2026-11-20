@@ -72,6 +72,18 @@ service cloud.firestore {
       return isOwner() || isAdmin() || isProduksi();
     }
 
+    function myInviteId() {
+      return request.auth.token.email.lower().replace('[^a-z0-9_-]', '_');
+    }
+
+    function hasActiveAdminInvite() {
+      return isVerified()
+        && exists(/databases/$(database)/documents/userInvites/$(myInviteId()))
+        && get(/databases/$(database)/documents/userInvites/$(myInviteId())).data.active == true
+        && get(/databases/$(database)/documents/userInvites/$(myInviteId())).data.role == 'ADMIN'
+        && get(/databases/$(database)/documents/userInvites/$(myInviteId())).data.email.lower() == request.auth.token.email.lower();
+    }
+
     // -------------------------------------------------------------------------
     // Validation Blueprints (isValid[Entity])
     // -------------------------------------------------------------------------
@@ -406,6 +418,9 @@ service cloud.firestore {
           && !exists(/databases/$(database)/documents/system/config))
         ||
         (docId == 'adminSlot'
+          && isValidAdminSlot(incoming())
+          && incoming().updatedAt == request.time
+          && !exists(/databases/$(database)/documents/system/adminSlot)
           && (
             isOwner()
             || (
@@ -415,14 +430,19 @@ service cloud.firestore {
               && existsAfter(/databases/$(database)/documents/users/$(request.auth.uid))
               && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'OWNER'
             )
-          )
-          && isValidAdminSlot(incoming())
-          && incoming().updatedAt == request.time
-          && !exists(/databases/$(database)/documents/system/adminSlot))
+            || (
+              hasActiveAdminInvite()
+              && incoming().occupied == true
+              && incoming().adminUid == request.auth.uid
+              && incoming().adminEmail is string
+              && incoming().adminEmail.lower() == request.auth.token.email.lower()
+            )
+          ))
       );
 
-      allow update: if isOwner() && (
+      allow update: if isVerified() && (
         (docId == 'config'
+          && isOwner()
           && isValidSystemConfig(incoming())
           && incoming().ownerUid == existing().ownerUid
           && incoming().updatedAt == request.time
@@ -431,11 +451,31 @@ service cloud.firestore {
         (docId == 'adminSlot'
           && isValidAdminSlot(incoming())
           && incoming().updatedAt == request.time
-          && incoming().diff(existing()).affectedKeys().hasOnly(['occupied', 'adminUid', 'adminEmail', 'updatedAt'])
           && (
-            !existing().occupied ||
-            !incoming().occupied ||
-            incoming().adminEmail == existing().adminEmail
+            (isOwner()
+              && incoming().diff(existing()).affectedKeys().hasOnly(['occupied', 'adminUid', 'adminEmail', 'updatedAt'])
+              && (
+                !existing().occupied ||
+                !incoming().occupied ||
+                incoming().adminEmail == existing().adminEmail
+              ))
+            ||
+            (!exists(/databases/$(database)/documents/system/config)
+              && existsAfter(/databases/$(database)/documents/system/config)
+              && getAfter(/databases/$(database)/documents/system/config).data.ownerUid == request.auth.uid
+              && existsAfter(/databases/$(database)/documents/users/$(request.auth.uid))
+              && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'OWNER'
+              && incoming().diff(existing()).affectedKeys().hasOnly(['occupied', 'adminUid', 'adminEmail', 'updatedAt']))
+            ||
+            (hasActiveAdminInvite()
+              && existing().occupied == true
+              && existing().adminEmail is string
+              && existing().adminEmail.lower() == request.auth.token.email.lower()
+              && (existing().adminUid == null || existing().adminUid == request.auth.uid)
+              && incoming().occupied == true
+              && incoming().adminUid == request.auth.uid
+              && incoming().adminEmail == existing().adminEmail
+              && incoming().diff(existing()).affectedKeys().hasOnly(['adminUid', 'updatedAt']))
           ))
       );
     }
@@ -476,6 +516,7 @@ service cloud.firestore {
           (isOwner()
             && (
               incoming().role != 'ADMIN' ||
+              incoming().active == false ||
               (existsAfter(/databases/$(database)/documents/system/adminSlot)
                 && getAfter(/databases/$(database)/documents/system/adminSlot).data.occupied == true
                 && getAfter(/databases/$(database)/documents/system/adminSlot).data.adminEmail.lower() == incoming().email.lower())
@@ -493,6 +534,7 @@ service cloud.firestore {
             && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'role', 'department', 'active', 'updatedAt'])
             && (
               incoming().role != 'ADMIN' ||
+              incoming().active == false ||
               (existsAfter(/databases/$(database)/documents/system/adminSlot)
                 && getAfter(/databases/$(database)/documents/system/adminSlot).data.occupied == true
                 && (getAfter(/databases/$(database)/documents/system/adminSlot).data.adminUid == userId || getAfter(/databases/$(database)/documents/system/adminSlot).data.adminEmail.lower() == existing().email.lower()))
@@ -511,7 +553,7 @@ service cloud.firestore {
     match /userInvites/{inviteId} {
       allow get: if isVerified() && isValidId(inviteId) && (
         isManager()
-        || (resource == null && inviteId == request.auth.token.email.lower().replace('[^a-z0-9_-]', '_'))
+        || (resource == null && inviteId == myInviteId())
         || (resource != null && existing().email.lower() == request.auth.token.email.lower())
       );
       allow list: if isVerified() && (isManager() || existing().email.lower() == request.auth.token.email.lower());
@@ -525,6 +567,7 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && (
           incoming().role != 'ADMIN' ||
+          incoming().active == false ||
           (existsAfter(/databases/$(database)/documents/system/adminSlot)
             && getAfter(/databases/$(database)/documents/system/adminSlot).data.occupied == true
             && getAfter(/databases/$(database)/documents/system/adminSlot).data.adminEmail.lower() == incoming().email.lower())
@@ -542,6 +585,7 @@ service cloud.firestore {
             && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'role', 'department', 'active', 'updatedAt'])
             && (
               incoming().role != 'ADMIN' ||
+              incoming().active == false ||
               (existsAfter(/databases/$(database)/documents/system/adminSlot)
                 && getAfter(/databases/$(database)/documents/system/adminSlot).data.occupied == true
                 && getAfter(/databases/$(database)/documents/system/adminSlot).data.adminEmail.lower() == existing().email.lower())

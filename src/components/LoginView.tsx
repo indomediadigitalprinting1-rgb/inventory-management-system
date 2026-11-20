@@ -210,6 +210,13 @@ export function LoginView() {
                   </button>
                 </form>
               )}
+
+              <div className="pt-3 border-t border-slate-100 flex items-start gap-2 text-[11px] text-slate-500">
+                <Lock className="w-3.5 h-3.5 shrink-0 mt-0.5 text-slate-400" />
+                <span>
+                  Keamanan sesi: akun otomatis keluar jika seluruh tab browser aplikasi ditutup lebih dari 5 menit.
+                </span>
+              </div>
             </>
           )}
 

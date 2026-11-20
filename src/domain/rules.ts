@@ -294,6 +294,10 @@ export function normalizeCodeKey(value: string): string {
   return sanitizeId(value.trim().toUpperCase());
 }
 
+export function normalizeTextKey(value: string): string {
+  return value.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
 export function generateCode128Value(prefix = 'IMS'): string {
   const ts = Date.now().toString().slice(-7);
   const rand = Math.floor(100 + Math.random() * 900);
@@ -405,9 +409,104 @@ export function validateAdminSlotAvailability(params: {
   return { allowed: true };
 }
 
+export function validateCategoryUniqueness(params: {
+  code: string;
+  name: string;
+  editingCategoryId?: string;
+  existingCategories: ReadonlyArray<Pick<Category, 'id' | 'code' | 'name'>>;
+}): { valid: boolean; error?: string } {
+  const normCode = params.code.trim().toUpperCase();
+  const normName = normalizeTextKey(params.name);
+  if (!normCode) return { valid: false, error: 'Kode kategori wajib diisi.' };
+  if (!normName) return { valid: false, error: 'Nama kategori wajib diisi.' };
+
+  const dupCode = params.existingCategories.find(
+    (c) => c.id !== params.editingCategoryId && c.code.trim().toUpperCase() === normCode
+  );
+  if (dupCode) {
+    return { valid: false, error: `Kode kategori "${params.code}" sudah digunakan oleh ${dupCode.name}.` };
+  }
+
+  const dupName = params.existingCategories.find(
+    (c) => c.id !== params.editingCategoryId && normalizeTextKey(c.name) === normName
+  );
+  if (dupName) {
+    return {
+      valid: false,
+      error: `Nama kategori "${params.name.trim()}" sudah terdaftar dengan kode ${dupName.code}. Gunakan nama kategori lain.`,
+    };
+  }
+
+  return { valid: true };
+}
+
+export function validateUnitUniqueness(params: {
+  code: string;
+  name: string;
+  editingUnitId?: string;
+  existingUnits: ReadonlyArray<Pick<Unit, 'id' | 'code' | 'name'>>;
+}): { valid: boolean; error?: string } {
+  const normCode = params.code.trim().toUpperCase();
+  const normName = normalizeTextKey(params.name);
+  if (!normCode) return { valid: false, error: 'Kode satuan wajib diisi.' };
+  if (!normName) return { valid: false, error: 'Nama satuan wajib diisi.' };
+
+  const dupCode = params.existingUnits.find(
+    (u) => u.id !== params.editingUnitId && u.code.trim().toUpperCase() === normCode
+  );
+  if (dupCode) {
+    return { valid: false, error: `Kode satuan "${params.code}" sudah digunakan oleh ${dupCode.name}.` };
+  }
+
+  const dupName = params.existingUnits.find(
+    (u) => u.id !== params.editingUnitId && normalizeTextKey(u.name) === normName
+  );
+  if (dupName) {
+    return {
+      valid: false,
+      error: `Nama satuan "${params.name.trim()}" sudah terdaftar dengan kode ${dupName.code}. Gunakan nama satuan lain.`,
+    };
+  }
+
+  return { valid: true };
+}
+
+export function validateSupplierUniqueness(params: {
+  code: string;
+  name: string;
+  editingSupplierId?: string;
+  existingSuppliers: ReadonlyArray<Pick<Supplier, 'id' | 'code' | 'name'>>;
+}): { valid: boolean; error?: string } {
+  const normCode = params.code.trim().toUpperCase();
+  const normName = normalizeTextKey(params.name);
+  if (!normCode) return { valid: false, error: 'Kode supplier wajib diisi.' };
+  if (!normName) return { valid: false, error: 'Nama supplier wajib diisi.' };
+
+  const dupCode = params.existingSuppliers.find(
+    (s) => s.id !== params.editingSupplierId && s.code.trim().toUpperCase() === normCode
+  );
+  if (dupCode) {
+    return { valid: false, error: `Kode supplier "${params.code}" sudah digunakan oleh ${dupCode.name}.` };
+  }
+
+  const dupName = params.existingSuppliers.find(
+    (s) => s.id !== params.editingSupplierId && normalizeTextKey(s.name) === normName
+  );
+  if (dupName) {
+    return {
+      valid: false,
+      error: `Nama supplier "${params.name.trim()}" sudah terdaftar dengan kode ${dupName.code}. Gunakan nama supplier lain.`,
+    };
+  }
+
+  return { valid: true };
+}
+
 export function validateItemUniqueness(params: {
   code: string;
   barcode: string;
+  name?: string;
+  specification?: string;
   editingItemId?: string;
   existingItems: InventoryItem[];
 }): { valid: boolean; error?: string } {
@@ -428,6 +527,24 @@ export function validateItemUniqueness(params: {
   );
   if (dupBarcode) {
     return { valid: false, error: `Barcode "${params.barcode}" sudah digunakan oleh ${dupBarcode.name}.` };
+  }
+
+  if (params.name !== undefined) {
+    const normName = normalizeTextKey(params.name);
+    if (!normName) return { valid: false, error: 'Nama barang wajib diisi.' };
+    const normSpec = normalizeTextKey(params.specification ?? '');
+    const dupNameSpec = params.existingItems.find(
+      (item) =>
+        item.id !== params.editingItemId &&
+        normalizeTextKey(item.name) === normName &&
+        normalizeTextKey(item.specification) === normSpec
+    );
+    if (dupNameSpec) {
+      return {
+        valid: false,
+        error: `Barang "${params.name.trim()}" dengan deskripsi/spesifikasi "${(params.specification ?? '').trim() || '-'}" sudah terdaftar pada kode ${dupNameSpec.code}. Gunakan spesifikasi atau nama barang yang berbeda.`,
+      };
+    }
   }
 
   return { valid: true };
@@ -1015,3 +1132,112 @@ export function computeStockFlowSeries(ledger: StockLedgerEntry[], days = 14): F
     .slice(-days)
     .map(([date, vals]) => ({ date, masuk: vals.masuk, keluar: vals.keluar }));
 }
+
+export const CLOSED_TAB_SESSION_TIMEOUT_MS = 5 * 60 * 1000;
+export const SESSION_ACTIVITY_STORAGE_KEY = 'ims_session_activity_v1';
+
+export interface SessionActivityState {
+  uid: string | null;
+  openTabs: Record<string, number>;
+  lastClosedAt: number | null;
+}
+
+export function parseSessionActivity(raw: string | null): SessionActivityState | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object') return null;
+    const obj = parsed as Record<string, unknown>;
+    const uid = typeof obj.uid === 'string' && obj.uid.trim() ? obj.uid : null;
+    const lastClosedAt =
+      typeof obj.lastClosedAt === 'number' && Number.isFinite(obj.lastClosedAt)
+        ? obj.lastClosedAt
+        : null;
+    const openTabs: Record<string, number> = {};
+    if (obj.openTabs && typeof obj.openTabs === 'object' && !Array.isArray(obj.openTabs)) {
+      for (const [tabId, beat] of Object.entries(obj.openTabs as Record<string, unknown>)) {
+        if (typeof beat === 'number' && Number.isFinite(beat) && beat > 0) {
+          openTabs[tabId] = beat;
+        }
+      }
+    }
+    return { uid, openTabs, lastClosedAt };
+  } catch {
+    return null;
+  }
+}
+
+export function recordTabHeartbeat(
+  snapshot: SessionActivityState | null,
+  tabId: string,
+  uid: string,
+  nowMs = Date.now(),
+  timeoutMs = CLOSED_TAB_SESSION_TIMEOUT_MS
+): SessionActivityState {
+  const sourceTabs = snapshot && snapshot.uid === uid ? snapshot.openTabs : {};
+  const nextTabs: Record<string, number> = {};
+  for (const [id, beat] of Object.entries(sourceTabs)) {
+    if (id !== tabId && Number.isFinite(beat) && nowMs - beat < timeoutMs) {
+      nextTabs[id] = beat;
+    }
+  }
+  nextTabs[tabId] = nowMs;
+  return {
+    uid,
+    openTabs: nextTabs,
+    lastClosedAt: null,
+  };
+}
+
+export function recordTabClosed(
+  snapshot: SessionActivityState | null,
+  tabId: string,
+  uid: string,
+  nowMs = Date.now(),
+  timeoutMs = CLOSED_TAB_SESSION_TIMEOUT_MS
+): SessionActivityState {
+  const sourceTabs = snapshot && snapshot.uid === uid ? snapshot.openTabs : {};
+  const nextTabs: Record<string, number> = {};
+  for (const [id, beat] of Object.entries(sourceTabs)) {
+    if (id !== tabId && Number.isFinite(beat) && nowMs - beat < timeoutMs) {
+      nextTabs[id] = beat;
+    }
+  }
+  const hasRemainingOpenTab = Object.keys(nextTabs).length > 0;
+  return {
+    uid,
+    openTabs: nextTabs,
+    lastClosedAt: hasRemainingOpenTab ? null : nowMs,
+  };
+}
+
+export function shouldExpireClosedTabSession(params: {
+  snapshot: SessionActivityState | null;
+  uid: string;
+  nowMs?: number;
+  timeoutMs?: number;
+}): boolean {
+  const nowMs = params.nowMs ?? Date.now();
+  const timeoutMs = params.timeoutMs ?? CLOSED_TAB_SESSION_TIMEOUT_MS;
+  const { snapshot, uid } = params;
+  if (!snapshot || !uid) return false;
+  if (snapshot.uid && snapshot.uid !== uid) return false;
+
+  const beatEntries = Object.values(snapshot.openTabs).filter(
+    (beat) => Number.isFinite(beat) && beat > 0
+  );
+  const hasLiveTab = beatEntries.some((beat) => nowMs - beat < timeoutMs);
+  if (hasLiveTab) return false;
+
+  const candidates = [
+    ...beatEntries,
+    ...(snapshot.lastClosedAt !== null && Number.isFinite(snapshot.lastClosedAt)
+      ? [snapshot.lastClosedAt]
+      : []),
+  ];
+  if (candidates.length === 0) return false;
+
+  const latestActivityMs = Math.max(...candidates);
+  return nowMs - latestActivityMs >= timeoutMs;
+}
+

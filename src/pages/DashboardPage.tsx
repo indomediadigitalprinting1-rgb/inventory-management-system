@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import {
   Bar,
   BarChart,
@@ -27,7 +28,22 @@ export function DashboardPage() {
     isSandbox,
   } = useInventory();
 
+  const [seedBusy, setSeedBusy] = useState(false);
+  const [seedError, setSeedError] = useState<string | null>(null);
+
   if (!currentUser) return null;
+
+  const handleSeedMasters = async () => {
+    setSeedBusy(true);
+    setSeedError(null);
+    try {
+      await seedStarterMasters();
+    } catch (err) {
+      setSeedError(err instanceof Error ? err.message : 'Gagal mengisi data master awal.');
+    } finally {
+      setSeedBusy(false);
+    }
+  };
 
   const today = new Date().toISOString().slice(0, 10);
   const metrics = computeDashboardMetrics({
@@ -183,23 +199,31 @@ export function DashboardPage() {
   return (
     <div className="space-y-6">
       {currentUser.role === 'OWNER' && !isSandbox && categories.length === 0 && items.length === 0 && (
-        <div className="bg-white border border-slate-200 rounded-xl p-5 flex flex-wrap items-center justify-between gap-4">
-          <div className="space-y-1">
-            <h2 className="font-display text-base font-semibold text-slate-900">
-              Siapkan Data Master Awal
-            </h2>
-            <p className="text-sm text-slate-600">
-              Database masih kosong. Anda dapat langsung mengisi kategori, satuan, dan supplier standar atau menambahkannya secara manual.
-            </p>
+        <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="space-y-1">
+              <h2 className="font-display text-base font-semibold text-slate-900">
+                Siapkan Data Master Awal
+              </h2>
+              <p className="text-sm text-slate-600">
+                Database masih kosong. Anda dapat langsung mengisi kategori, satuan, dan supplier standar atau menambahkannya secara manual.
+              </p>
+            </div>
+            <button
+              type="button"
+              disabled={seedBusy}
+              onClick={() => void handleSeedMasters()}
+              className="inline-flex items-center gap-2 px-4 py-2.5 bg-red-800 text-white text-sm font-medium rounded-lg hover:bg-red-900 whitespace-nowrap disabled:opacity-60"
+            >
+              <DatabaseZap className="w-4 h-4" />
+              {seedBusy ? 'Menyiapkan...' : 'Isi Master Awal'}
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={() => void seedStarterMasters()}
-            className="inline-flex items-center gap-2 px-4 py-2.5 bg-red-800 text-white text-sm font-medium rounded-lg hover:bg-red-900 whitespace-nowrap"
-          >
-            <DatabaseZap className="w-4 h-4" />
-            Isi Master Awal
-          </button>
+          {seedError && (
+            <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-800">
+              {seedError}
+            </div>
+          )}
         </div>
       )}
 
