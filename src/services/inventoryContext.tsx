@@ -10,8 +10,10 @@ import {
 } from 'firebase/auth';
 import {
   collection,
+  deleteDoc,
   doc,
   getDoc,
+  getDocs,
   onSnapshot,
   query,
   runTransaction,
@@ -30,17 +32,31 @@ import {
   calculateIncomingTotal,
   canAdjustStock,
   canApproveOrDeliver,
+  canDeleteCategory,
   canDeleteItemPermanently,
+  canDeleteNotification,
+  canDeleteStockRequest,
+  canDeleteSupplier,
+  canDeleteUnit,
   canEditMasterItems,
   canManageUnits,
   canManageUsers,
   createIncomingReversal,
   emailToInviteId,
+  filterVisibleNotifications,
   generateDocNumber,
+  getNonOwnerUsers,
+  getNotificationReadAt,
   normalizeCodeKey,
+  partitionDeletableCategories,
+  partitionDeletableItems,
+  partitionDeletableSuppliers,
+  partitionDeletableUnits,
   processStockDelivery,
+  READ_NOTIFICATION_TTL_MS,
   reviewStockRequest,
   sanitizeId,
+  sortItemsByCode,
   validateAdminSlotAvailability,
   validateItemUniqueness,
 } from '../domain/rules';
@@ -65,6 +81,12 @@ import type {
   UserInvite,
   UserRole,
 } from '../domain/types';
+import {
+  generateSequentialMasterCode,
+  generateUnitCodeFromName,
+  type MasterDatabaseImportSummary,
+  type ParsedMasterDatabase,
+} from '../domain/masterExcel';
 import { createSandboxSeedData, type InventorySnapshotState } from './sandboxSeed';
 
 function toIso(val: unknown): string {
@@ -80,10 +102,22 @@ function toIso(val: unknown): string {
 
 function normalizeDocDates<T extends Record<string, unknown>>(data: T): T {
   const out: Record<string, unknown> = { ...data };
-  for (const key of ['createdAt', 'updatedAt', 'confirmedAt', 'approvedAt']) {
+  for (const key of ['createdAt', 'updatedAt']) {
+    out[key] = toIso(out[key]);
+  }
+  for (const key of ['confirmedAt', 'approvedAt']) {
     if (out[key] !== undefined && out[key] !== null) {
       out[key] = toIso(out[key]);
     }
+  }
+  if (out.readAtBy && typeof out.readAtBy === 'object' && !Array.isArray(out.readAtBy)) {
+    const normalizedMap: Record<string, string> = {};
+    for (const [uid, val] of Object.entries(out.readAtBy as Record<string, unknown>)) {
+      if (val !== undefined && val !== null) {
+        normalizedMap[uid] = toIso(val);
+      }
+    }
+    out.readAtBy = normalizedMap;
   }
   return out as T;
 }
@@ -134,9 +168,18 @@ export interface InventoryContextValue {
   // Master & User Actions
   saveUserInvite: (input: { name: string; email: string; role: 'ADMIN' | 'PRODUKSI'; department: string; active: boolean }) => Promise<void>;
   updateUserAccountRoleOrStatus: (user: UserAccount, updates: { name: string; role: UserRole; department: string; active: boolean }) => Promise<void>;
-  saveCategory: (input: { id?: string; code: string; name: string; description: string; active: boolean }) => Promise<void>;
-  saveUnit: (input: { id?: string; code: string; name: string; description: string; active: boolean }) => Promise<void>;
-  saveSupplier: (input: { id?: string; code: string; name: string; contactPerson: string; phone: string; email: string; address: string; active: boolean }) => Promise<void>;
+  deleteUserAccount: (user: UserAccount) => Promise<void>;
+  deleteUserInvite: (invite: UserInvite) => Promise<void>;
+  deleteAllNonOwnerUsers: () => Promise<{ deletedUsers: number; deletedInvites: number }>;
+  saveCategory: (input: { id?: string; code: string; name: string; description: string; active: boolean }) => Promise<Category>;
+  deleteCategory: (category: Category) => Promise<void>;
+  deleteCategoriesBatch: (targetCategories: Category[]) => Promise<{ deletedCount: number; skipped: string[] }>;
+  saveUnit: (input: { id?: string; code: string; name: string; description: string; active: boolean }) => Promise<Unit>;
+  deleteUnit: (unit: Unit) => Promise<void>;
+  deleteUnitsBatch: (targetUnits: Unit[]) => Promise<{ deletedCount: number; skipped: string[] }>;
+  saveSupplier: (input: { id?: string; code: string; name: string; contactPerson: string; phone: string; email: string; address: string; active: boolean }) => Promise<Supplier>;
+  deleteSupplier: (supplier: Supplier) => Promise<void>;
+  deleteSuppliersBatch: (targetSuppliers: Supplier[]) => Promise<{ deletedCount: number; skipped: string[] }>;
   saveItem: (input: {
     id?: string;
     code: string;
@@ -151,19 +194,9 @@ export interface InventoryContextValue {
     supplierId: string;
     active: boolean;
   }) => Promise<void>;
-  importItemsBatch: (rows: Array<{
-    code: string;
-    barcode: string;
-    name: string;
-    categoryName: string;
-    specification: string;
-    unitName: string;
-    initialStock: number;
-    minStock: number;
-    purchasePrice: number;
-    supplierName: string;
-  }>) => Promise<{ imported: number; skipped: string[] }>;
+  importItemsBatch: (data: ParsedMasterDatabase) => Promise<MasterDatabaseImportSummary>;
   deleteItemPermanently: (item: InventoryItem) => Promise<void>;
+  deleteItemsBatch: (targetItems: InventoryItem[]) => Promise<{ deletedCount: number; skipped: string[] }>;
 
   // Transaction Actions
   saveIncomingDraft: (input: {
@@ -188,6 +221,7 @@ export interface InventoryContextValue {
     rejectionReason?: string;
   }) => Promise<void>;
   cancelRequest: (request: StockRequest) => Promise<void>;
+  deleteStockRequest: (request: StockRequest) => Promise<void>;
   confirmStockDelivery: (input: {
     request: StockRequest;
     deliverQuantities: Record<string, number>;
@@ -201,7 +235,10 @@ export interface InventoryContextValue {
     reason: string;
   }) => Promise<void>;
 
+  notifNowMs: number;
   markNotificationAsRead: (notif: NotificationItem) => Promise<void>;
+  deleteNotification: (notif: NotificationItem) => Promise<void>;
+  deleteAllNotifications: () => Promise<void>;
   updateSystemSettings: (input: { companyName: string; lowStockAlertEnabled: boolean }) => Promise<void>;
   exportBackupJson: () => string;
   seedStarterMasters: () => Promise<void>;
@@ -260,6 +297,7 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
   const [adjustments, setAdjustments] = useState<StockAdjustment[]>([]);
   const [ledger, setLedger] = useState<StockLedgerEntry[]>([]);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
+  const [notifNowMs, setNotifNowMs] = useState<number>(() => Date.now());
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
 
   const addToScannerDraftCart = useCallback((itemId: string, qty = 1) => {
@@ -454,7 +492,9 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
       const unsub = onSnapshot(
         ref,
         (snap) => {
-          const rows = snap.docs.map((d) => normalizeDocDates(d.data() as Record<string, unknown>) as unknown as T);
+          const rows = snap.docs.map((d) =>
+            normalizeDocDates(d.data({ serverTimestamps: 'estimate' }) as Record<string, unknown>) as unknown as T
+          );
           setter(rows);
         },
         (err) => handleFirestoreError(err, OperationType.LIST, path)
@@ -490,15 +530,16 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
       listenCollection<StockAdjustment>('stockAdjustments', setAdjustments);
       listenCollection<StockLedgerEntry>('stockLedgers', setLedger);
       listenCollection<UserAccount>('users', setUsers);
-      listenCollection<UserInvite>('userInvites', setInvites);
 
       if (currentUser.role === 'ADMIN') {
+        setInvites([]);
         listenCollection<NotificationItem>(
           'notifications',
           setNotifications,
           query(collection(db, 'notifications'), where('targetRole', '==', 'ADMIN'))
         );
       } else {
+        listenCollection<UserInvite>('userInvites', setInvites);
         listenCollection<NotificationItem>('notifications', setNotifications);
         listenCollection<AuditLog>('auditLogs', setAuditLogs);
       }
@@ -543,7 +584,10 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
   const effectiveCategories = isSandbox ? sandboxState?.categories ?? [] : categories;
   const effectiveUnits = isSandbox ? sandboxState?.units ?? [] : units;
   const effectiveSuppliers = isSandbox ? sandboxState?.suppliers ?? [] : suppliers;
-  const effectiveItems = isSandbox ? sandboxState?.items ?? [] : items;
+  const effectiveItems = useMemo(
+    () => sortItemsByCode(isSandbox ? sandboxState?.items ?? [] : items),
+    [isSandbox, items, sandboxState?.items]
+  );
   const effectiveIncoming = isSandbox ? sandboxState?.incoming ?? [] : incoming;
   const effectiveRequests = isSandbox
     ? currentUser?.role === 'PRODUKSI'
@@ -557,14 +601,52 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
     : deliveries;
   const effectiveAdjustments = isSandbox ? sandboxState?.adjustments ?? [] : adjustments;
   const effectiveLedger = isSandbox ? sandboxState?.ledger ?? [] : ledger;
-  const effectiveNotifications = isSandbox
-    ? (sandboxState?.notifications ?? []).filter((n) => {
-        if (!currentUser) return false;
-        if (currentUser.role === 'OWNER') return true;
-        if (currentUser.role === 'ADMIN') return n.targetRole === 'ADMIN' || n.targetUid === currentUser.uid;
-        return n.targetUid === currentUser.uid;
-      })
-    : notifications;
+  const scopedNotifications = useMemo(() => {
+    const list = isSandbox
+      ? (sandboxState?.notifications ?? []).filter((n) => {
+          if (!currentUser) return false;
+          if (currentUser.role === 'OWNER') return true;
+          if (currentUser.role === 'ADMIN') return n.targetRole === 'ADMIN' || n.targetUid === currentUser.uid;
+          return n.targetUid === currentUser.uid;
+        })
+      : notifications;
+    return [...list].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }, [currentUser, isSandbox, notifications, sandboxState?.notifications]);
+
+  const effectiveNotifications = useMemo(() => {
+    if (!currentUser) return [];
+    return filterVisibleNotifications(scopedNotifications, currentUser.uid, notifNowMs);
+  }, [currentUser, notifNowMs, scopedNotifications]);
+
+  // Automatically expire read notifications 30 minutes after they were read
+  useEffect(() => {
+    if (!currentUser || effectiveNotifications.length === 0) return;
+    let earliestExpiry: number | null = null;
+    for (const notif of effectiveNotifications) {
+      const readAtIso = getNotificationReadAt(notif, currentUser.uid);
+      if (!readAtIso) continue;
+      const readAtMs = Date.parse(readAtIso);
+      if (!Number.isFinite(readAtMs)) continue;
+      const expiryMs = readAtMs + READ_NOTIFICATION_TTL_MS;
+      if (earliestExpiry === null || expiryMs < earliestExpiry) {
+        earliestExpiry = expiryMs;
+      }
+    }
+    if (earliestExpiry === null) return;
+
+    const delayMs = Math.max(50, earliestExpiry - Date.now() + 50);
+    const timeoutId = window.setTimeout(() => {
+      setNotifNowMs(Date.now());
+    }, delayMs);
+    const intervalId = window.setInterval(() => {
+      setNotifNowMs(Date.now());
+    }, 30_000);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+      window.clearInterval(intervalId);
+    };
+  }, [currentUser, effectiveNotifications]);
   const effectiveAuditLogs = isSandbox ? sandboxState?.auditLogs ?? [] : auditLogs;
 
   // Auth Actions
@@ -583,14 +665,7 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
     try {
       await signInWithEmailAndPassword(auth, email.trim(), password);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('operation-not-allowed')) {
-        setAuthError(
-          'Provider Email/Password belum diaktifkan di Firebase Console. Aktifkan di Authentication -> Sign-in method, atau gunakan Masuk dengan Google.'
-        );
-      } else {
-        setAuthError(msg);
-      }
+      setAuthError(err instanceof Error ? err.message : 'Email atau kata sandi salah.');
     }
   }, []);
 
@@ -815,6 +890,7 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
         const check = validateAdminSlotAvailability({
           targetRole: 'ADMIN',
           targetEmail: user.email,
+          excludeUid: user.uid,
           adminSlot: effectiveAdminSlot,
           existingUsers: effectiveUsers,
           existingInvites: effectiveInvites,
@@ -829,7 +905,10 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
           let nextSlot = prev.adminSlot;
           if (updates.role === 'ADMIN' && updates.active) {
             nextSlot = { occupied: true, adminUid: user.uid, adminEmail: user.email, updatedAt: nowIso };
-          } else if (prev.adminSlot.adminEmail?.toLowerCase() === user.email.toLowerCase()) {
+          } else if (
+            prev.adminSlot.adminUid === user.uid ||
+            prev.adminSlot.adminEmail?.toLowerCase() === user.email.toLowerCase()
+          ) {
             nextSlot = { occupied: false, adminUid: null, adminEmail: null, updatedAt: nowIso };
           }
           return {
@@ -838,7 +917,14 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
             users: prev.users.map((u) =>
               u.uid === user.uid ? { ...u, ...updates, updatedAt: nowIso } : u
             ),
-            auditLogs: appendSandboxAudit(prev, currentUser, 'UPDATE_USER', 'USER', user.uid, `Memperbarui ${user.email}: role=${updates.role}, aktif=${updates.active}.`),
+            auditLogs: appendSandboxAudit(
+              prev,
+              currentUser,
+              'UPDATE_USER',
+              'USER',
+              user.uid,
+              `Memperbarui ${user.email}: role=${updates.role}, aktif=${updates.active}.`
+            ),
           };
         });
         return;
@@ -850,15 +936,24 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
         const currentSlot = slotSnap.exists() ? (slotSnap.data() as AdminSlot) : { occupied: false, adminUid: null, adminEmail: null };
 
         if (updates.role === 'ADMIN' && updates.active) {
-          if (currentSlot.occupied && currentSlot.adminEmail && currentSlot.adminEmail.toLowerCase() !== user.email.toLowerCase()) {
-            throw new Error(`Slot ADMIN sudah ditempati oleh ${currentSlot.adminEmail}.`);
+          if (
+            currentSlot.occupied &&
+            ((currentSlot.adminUid && currentSlot.adminUid !== user.uid) ||
+              (!currentSlot.adminUid &&
+                currentSlot.adminEmail &&
+                currentSlot.adminEmail.toLowerCase() !== user.email.toLowerCase()))
+          ) {
+            throw new Error(`Slot ADMIN sudah ditempati oleh ${currentSlot.adminEmail ?? 'pengguna lain'}.`);
           }
           tx.set(
             slotRef,
             { occupied: true, adminUid: user.uid, adminEmail: user.email.toLowerCase(), updatedAt: serverTimestamp() },
             { merge: true }
           );
-        } else if (currentSlot.occupied && currentSlot.adminEmail?.toLowerCase() === user.email.toLowerCase()) {
+        } else if (
+          currentSlot.occupied &&
+          (currentSlot.adminUid === user.uid || currentSlot.adminEmail?.toLowerCase() === user.email.toLowerCase())
+        ) {
           tx.set(
             slotRef,
             { occupied: false, adminUid: null, adminEmail: null, updatedAt: serverTimestamp() },
@@ -875,176 +970,785 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
         });
       });
 
-      await writeAuditLogFirestore(currentUser, 'UPDATE_USER', 'USER', user.uid, `Memperbarui ${user.email}: role=${updates.role}, aktif=${updates.active}.`);
+      await writeAuditLogFirestore(
+        currentUser,
+        'UPDATE_USER',
+        'USER',
+        user.uid,
+        `Memperbarui ${user.email}: role=${updates.role}, aktif=${updates.active}.`
+      );
     },
     [appendSandboxAudit, currentUser, effectiveAdminSlot, effectiveInvites, effectiveUsers, isSandbox, writeAuditLogFirestore]
   );
 
-  // Categories, Units, Suppliers
-  const saveCategory = useCallback(
-    async (input: { id?: string; code: string; name: string; description: string; active: boolean }) => {
-      if (!currentUser || !canEditMasterItems(currentUser.role)) throw new Error('Akses ditolak.');
-      const id = input.id ?? sanitizeId(`cat_${Date.now()}`);
+  const deleteUserAccount = useCallback(
+    async (user: UserAccount) => {
+      if (!currentUser || !canManageUsers(currentUser.role)) {
+        throw new Error('Hanya OWNER yang dapat menghapus akun pengguna.');
+      }
+      if (user.role === 'OWNER' || user.uid === currentUser.uid) {
+        throw new Error('Akun Owner tidak dapat dihapus.');
+      }
+
       const nowIso = new Date().toISOString();
+
       if (isSandbox) {
         setSandboxState((prev) => {
           if (!prev) return prev;
-          const exists = prev.categories.some((c) => c.id === id);
-          const nextObj: Category = { ...input, id, createdAt: nowIso, updatedAt: nowIso };
+          const clearsAdminSlot =
+            prev.adminSlot.adminUid === user.uid ||
+            prev.adminSlot.adminEmail?.toLowerCase() === user.email.toLowerCase();
           return {
             ...prev,
-            categories: exists ? prev.categories.map((c) => (c.id === id ? { ...c, ...input, updatedAt: nowIso } : c)) : [nextObj, ...prev.categories],
-            auditLogs: appendSandboxAudit(prev, currentUser, exists ? 'UPDATE_CATEGORY' : 'CREATE_CATEGORY', 'CATEGORY', id, `Kategori ${input.name}`),
+            adminSlot: clearsAdminSlot
+              ? { occupied: false, adminUid: null, adminEmail: null, updatedAt: nowIso }
+              : prev.adminSlot,
+            users: prev.users.filter((u) => u.uid !== user.uid),
+            invites: user.inviteId ? prev.invites.filter((inv) => inv.id !== user.inviteId) : prev.invites,
+            auditLogs: appendSandboxAudit(
+              prev,
+              currentUser,
+              'DELETE_USER',
+              'USER',
+              user.uid,
+              `Menghapus akun ${user.email} (${user.role}).`
+            ),
           };
         });
         return;
       }
+
+      try {
+        await runTransaction(db, async (tx) => {
+          const userRef = doc(db, 'users', user.uid);
+          const slotRef = doc(db, 'system', 'adminSlot');
+          const inviteRef = user.inviteId ? doc(db, 'userInvites', user.inviteId) : null;
+
+          const [slotSnap, inviteSnap] = await Promise.all([
+            tx.get(slotRef),
+            inviteRef ? tx.get(inviteRef) : Promise.resolve(null),
+          ]);
+
+          if (slotSnap.exists()) {
+            const slot = slotSnap.data() as AdminSlot;
+            if (
+              slot.occupied &&
+              (slot.adminUid === user.uid || slot.adminEmail?.toLowerCase() === user.email.toLowerCase())
+            ) {
+              tx.update(slotRef, {
+                occupied: false,
+                adminUid: null,
+                adminEmail: null,
+                updatedAt: serverTimestamp(),
+              });
+            }
+          }
+
+          if (inviteRef && inviteSnap?.exists()) {
+            tx.delete(inviteRef);
+          }
+          tx.delete(userRef);
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.DELETE, `users/${user.uid}`);
+      }
+
+      await writeAuditLogFirestore(
+        currentUser,
+        'DELETE_USER',
+        'USER',
+        user.uid,
+        `Menghapus akun ${user.email} (${user.role}).`
+      );
+    },
+    [appendSandboxAudit, currentUser, isSandbox, writeAuditLogFirestore]
+  );
+
+  const deleteUserInvite = useCallback(
+    async (invite: UserInvite) => {
+      if (!currentUser || !canManageUsers(currentUser.role)) {
+        throw new Error('Hanya OWNER yang dapat menghapus undangan pengguna.');
+      }
+      const nowIso = new Date().toISOString();
+
+      if (isSandbox) {
+        setSandboxState((prev) => {
+          if (!prev) return prev;
+          const clearsSlot =
+            !prev.adminSlot.adminUid &&
+            prev.adminSlot.adminEmail?.toLowerCase() === invite.email.toLowerCase();
+          return {
+            ...prev,
+            adminSlot: clearsSlot
+              ? { occupied: false, adminUid: null, adminEmail: null, updatedAt: nowIso }
+              : prev.adminSlot,
+            invites: prev.invites.filter((i) => i.id !== invite.id),
+            auditLogs: appendSandboxAudit(
+              prev,
+              currentUser,
+              'DELETE_USER_INVITE',
+              'USER_INVITE',
+              invite.id,
+              `Menghapus otorisasi undangan ${invite.email}.`
+            ),
+          };
+        });
+        return;
+      }
+
+      try {
+        await runTransaction(db, async (tx) => {
+          const inviteRef = doc(db, 'userInvites', invite.id);
+          const slotRef = doc(db, 'system', 'adminSlot');
+          const slotSnap = await tx.get(slotRef);
+          if (slotSnap.exists()) {
+            const slot = slotSnap.data() as AdminSlot;
+            if (
+              slot.occupied &&
+              !slot.adminUid &&
+              slot.adminEmail?.toLowerCase() === invite.email.toLowerCase()
+            ) {
+              tx.update(slotRef, {
+                occupied: false,
+                adminUid: null,
+                adminEmail: null,
+                updatedAt: serverTimestamp(),
+              });
+            }
+          }
+          tx.delete(inviteRef);
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.DELETE, `userInvites/${invite.id}`);
+      }
+
+      await writeAuditLogFirestore(
+        currentUser,
+        'DELETE_USER_INVITE',
+        'USER_INVITE',
+        invite.id,
+        `Menghapus otorisasi undangan ${invite.email}.`
+      );
+    },
+    [appendSandboxAudit, currentUser, isSandbox, writeAuditLogFirestore]
+  );
+
+  const deleteAllNonOwnerUsers = useCallback(async (): Promise<{
+    deletedUsers: number;
+    deletedInvites: number;
+  }> => {
+    if (!currentUser || !canManageUsers(currentUser.role)) {
+      throw new Error('Hanya OWNER yang dapat membersihkan data pengguna.');
+    }
+    const nowIso = new Date().toISOString();
+
+    if (isSandbox) {
+      const nonOwnerCount = getNonOwnerUsers(effectiveUsers).length;
+      const inviteCount = effectiveInvites.length;
+      setSandboxState((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          users: prev.users.filter((u) => u.role === 'OWNER'),
+          invites: [],
+          adminSlot: { occupied: false, adminUid: null, adminEmail: null, updatedAt: nowIso },
+          auditLogs: appendSandboxAudit(
+            prev,
+            currentUser,
+            'CLEANUP_NON_OWNER_USERS',
+            'USER',
+            'all-non-owner',
+            `Menghapus ${nonOwnerCount} akun non-owner dan ${inviteCount} undangan, menyisakan Owner.`
+          ),
+        };
+      });
+      return { deletedUsers: nonOwnerCount, deletedInvites: inviteCount };
+    }
+
+    try {
+      const [usersSnap, invitesSnap, slotSnap] = await Promise.all([
+        getDocs(collection(db, 'users')),
+        getDocs(collection(db, 'userInvites')),
+        getDoc(doc(db, 'system', 'adminSlot')),
+      ]);
+
+      const refsToDelete = [
+        ...usersSnap.docs
+          .filter((d) => {
+            const data = d.data() as Partial<UserAccount>;
+            return d.id !== currentUser.uid && data.role !== 'OWNER';
+          })
+          .map((d) => d.ref),
+        ...invitesSnap.docs.map((d) => d.ref),
+      ];
+
+      const deletedUsers = usersSnap.docs.filter((d) => {
+        const data = d.data() as Partial<UserAccount>;
+        return d.id !== currentUser.uid && data.role !== 'OWNER';
+      }).length;
+      const deletedInvites = invitesSnap.docs.length;
+
+      for (let i = 0; i < refsToDelete.length; i += 400) {
+        const batch = writeBatch(db);
+        for (const ref of refsToDelete.slice(i, i + 400)) {
+          batch.delete(ref);
+        }
+        if (i === 0 && slotSnap.exists()) {
+          batch.update(doc(db, 'system', 'adminSlot'), {
+            occupied: false,
+            adminUid: null,
+            adminEmail: null,
+            updatedAt: serverTimestamp(),
+          });
+        }
+        await batch.commit();
+      }
+
+      if (refsToDelete.length === 0 && slotSnap.exists()) {
+        await updateDoc(doc(db, 'system', 'adminSlot'), {
+          occupied: false,
+          adminUid: null,
+          adminEmail: null,
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      await writeAuditLogFirestore(
+        currentUser,
+        'CLEANUP_NON_OWNER_USERS',
+        'USER',
+        'all-non-owner',
+        `Menghapus ${deletedUsers} akun pengguna lain dan ${deletedInvites} undangan, menyisakan data Owner.`
+      );
+
+      return { deletedUsers, deletedInvites };
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, 'users');
+    }
+  }, [appendSandboxAudit, currentUser, effectiveInvites.length, effectiveUsers, isSandbox, writeAuditLogFirestore]);
+
+  // Categories, Units, Suppliers
+  const saveCategory = useCallback(
+    async (input: { id?: string; code: string; name: string; description: string; active: boolean }): Promise<Category> => {
+      if (!currentUser || !canEditMasterItems(currentUser.role)) throw new Error('Akses ditolak.');
+      const id = input.id ?? sanitizeId(`cat_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`);
+      const nowIso = new Date().toISOString();
+      const saved: Category = {
+        id,
+        code: input.code.trim(),
+        name: input.name.trim(),
+        description: input.description.trim(),
+        active: input.active,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+      if (isSandbox) {
+        setSandboxState((prev) => {
+          if (!prev) return prev;
+          const exists = prev.categories.some((c) => c.id === id);
+          return {
+            ...prev,
+            categories: exists
+              ? prev.categories.map((c) => (c.id === id ? { ...c, ...saved, createdAt: c.createdAt } : c))
+              : [saved, ...prev.categories],
+            auditLogs: appendSandboxAudit(prev, currentUser, exists ? 'UPDATE_CATEGORY' : 'CREATE_CATEGORY', 'CATEGORY', id, `Kategori ${saved.name}`),
+          };
+        });
+        return saved;
+      }
       if (input.id) {
         await updateDoc(doc(db, 'categories', id), {
-          code: input.code.trim(),
-          name: input.name.trim(),
-          description: input.description.trim(),
-          active: input.active,
+          code: saved.code,
+          name: saved.name,
+          description: saved.description,
+          active: saved.active,
           updatedAt: serverTimestamp(),
         });
       } else {
         await setDoc(doc(db, 'categories', id), {
           id,
-          code: input.code.trim(),
-          name: input.name.trim(),
-          description: input.description.trim(),
-          active: input.active,
+          code: saved.code,
+          name: saved.name,
+          description: saved.description,
+          active: saved.active,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
       }
-      await writeAuditLogFirestore(currentUser, input.id ? 'UPDATE_CATEGORY' : 'CREATE_CATEGORY', 'CATEGORY', id, `Menyimpan kategori ${input.name}.`);
+      await writeAuditLogFirestore(currentUser, input.id ? 'UPDATE_CATEGORY' : 'CREATE_CATEGORY', 'CATEGORY', id, `Menyimpan kategori ${saved.name}.`);
+      return saved;
     },
     [appendSandboxAudit, currentUser, isSandbox, writeAuditLogFirestore]
   );
 
   const saveUnit = useCallback(
-    async (input: { id?: string; code: string; name: string; description: string; active: boolean }) => {
+    async (input: { id?: string; code: string; name: string; description: string; active: boolean }): Promise<Unit> => {
       if (!currentUser || !canManageUnits(currentUser.role)) throw new Error('Hanya OWNER yang dapat mengelola satuan.');
-      const id = input.id ?? sanitizeId(`unit_${Date.now()}`);
+      const id = input.id ?? sanitizeId(`unit_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`);
       const nowIso = new Date().toISOString();
+      const saved: Unit = {
+        id,
+        code: input.code.trim(),
+        name: input.name.trim(),
+        description: input.description.trim(),
+        active: input.active,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
       if (isSandbox) {
         setSandboxState((prev) => {
           if (!prev) return prev;
           const exists = prev.units.some((u) => u.id === id);
-          const nextObj: Unit = { ...input, id, createdAt: nowIso, updatedAt: nowIso };
           return {
             ...prev,
-            units: exists ? prev.units.map((u) => (u.id === id ? { ...u, ...input, updatedAt: nowIso } : u)) : [nextObj, ...prev.units],
-            auditLogs: appendSandboxAudit(prev, currentUser, exists ? 'UPDATE_UNIT' : 'CREATE_UNIT', 'UNIT', id, `Satuan ${input.name}`),
+            units: exists
+              ? prev.units.map((u) => (u.id === id ? { ...u, ...saved, createdAt: u.createdAt } : u))
+              : [saved, ...prev.units],
+            auditLogs: appendSandboxAudit(prev, currentUser, exists ? 'UPDATE_UNIT' : 'CREATE_UNIT', 'UNIT', id, `Satuan ${saved.name}`),
           };
         });
-        return;
+        return saved;
       }
       if (input.id) {
         await updateDoc(doc(db, 'units', id), {
-          code: input.code.trim(),
-          name: input.name.trim(),
-          description: input.description.trim(),
-          active: input.active,
+          code: saved.code,
+          name: saved.name,
+          description: saved.description,
+          active: saved.active,
           updatedAt: serverTimestamp(),
         });
       } else {
         await setDoc(doc(db, 'units', id), {
           id,
-          code: input.code.trim(),
-          name: input.name.trim(),
-          description: input.description.trim(),
-          active: input.active,
+          code: saved.code,
+          name: saved.name,
+          description: saved.description,
+          active: saved.active,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
       }
-      await writeAuditLogFirestore(currentUser, input.id ? 'UPDATE_UNIT' : 'CREATE_UNIT', 'UNIT', id, `Menyimpan satuan ${input.name}.`);
+      await writeAuditLogFirestore(currentUser, input.id ? 'UPDATE_UNIT' : 'CREATE_UNIT', 'UNIT', id, `Menyimpan satuan ${saved.name}.`);
+      return saved;
     },
     [appendSandboxAudit, currentUser, isSandbox, writeAuditLogFirestore]
   );
 
   const saveSupplier = useCallback(
-    async (input: { id?: string; code: string; name: string; contactPerson: string; phone: string; email: string; address: string; active: boolean }) => {
+    async (input: { id?: string; code: string; name: string; contactPerson: string; phone: string; email: string; address: string; active: boolean }): Promise<Supplier> => {
       if (!currentUser || !canEditMasterItems(currentUser.role)) throw new Error('Akses ditolak.');
-      const id = input.id ?? sanitizeId(`sup_${Date.now()}`);
+      const id = input.id ?? sanitizeId(`sup_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`);
       const nowIso = new Date().toISOString();
+      const saved: Supplier = {
+        id,
+        code: input.code.trim(),
+        name: input.name.trim(),
+        contactPerson: input.contactPerson.trim(),
+        phone: input.phone.trim(),
+        email: input.email.trim(),
+        address: input.address.trim(),
+        active: input.active,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
       if (isSandbox) {
         setSandboxState((prev) => {
           if (!prev) return prev;
           const exists = prev.suppliers.some((s) => s.id === id);
-          const nextObj: Supplier = { ...input, id, createdAt: nowIso, updatedAt: nowIso };
           return {
             ...prev,
-            suppliers: exists ? prev.suppliers.map((s) => (s.id === id ? { ...s, ...input, updatedAt: nowIso } : s)) : [nextObj, ...prev.suppliers],
-            auditLogs: appendSandboxAudit(prev, currentUser, exists ? 'UPDATE_SUPPLIER' : 'CREATE_SUPPLIER', 'SUPPLIER', id, `Supplier ${input.name}`),
+            suppliers: exists
+              ? prev.suppliers.map((s) => (s.id === id ? { ...s, ...saved, createdAt: s.createdAt } : s))
+              : [saved, ...prev.suppliers],
+            auditLogs: appendSandboxAudit(prev, currentUser, exists ? 'UPDATE_SUPPLIER' : 'CREATE_SUPPLIER', 'SUPPLIER', id, `Supplier ${saved.name}`),
           };
         });
-        return;
+        return saved;
       }
       if (input.id) {
         await updateDoc(doc(db, 'suppliers', id), {
-          code: input.code.trim(),
-          name: input.name.trim(),
-          contactPerson: input.contactPerson.trim(),
-          phone: input.phone.trim(),
-          email: input.email.trim(),
-          address: input.address.trim(),
-          active: input.active,
+          code: saved.code,
+          name: saved.name,
+          contactPerson: saved.contactPerson,
+          phone: saved.phone,
+          email: saved.email,
+          address: saved.address,
+          active: saved.active,
           updatedAt: serverTimestamp(),
         });
       } else {
         await setDoc(doc(db, 'suppliers', id), {
           id,
-          code: input.code.trim(),
-          name: input.name.trim(),
-          contactPerson: input.contactPerson.trim(),
-          phone: input.phone.trim(),
-          email: input.email.trim(),
-          address: input.address.trim(),
-          active: input.active,
+          code: saved.code,
+          name: saved.name,
+          contactPerson: saved.contactPerson,
+          phone: saved.phone,
+          email: saved.email,
+          address: saved.address,
+          active: saved.active,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
       }
-      await writeAuditLogFirestore(currentUser, input.id ? 'UPDATE_SUPPLIER' : 'CREATE_SUPPLIER', 'SUPPLIER', id, `Menyimpan supplier ${input.name}.`);
+      await writeAuditLogFirestore(currentUser, input.id ? 'UPDATE_SUPPLIER' : 'CREATE_SUPPLIER', 'SUPPLIER', id, `Menyimpan supplier ${saved.name}.`);
+      return saved;
     },
     [appendSandboxAudit, currentUser, isSandbox, writeAuditLogFirestore]
   );
 
+  const deleteCategory = useCallback(
+    async (category: Category) => {
+      if (!currentUser || currentUser.role !== 'OWNER') {
+        throw new Error('Hanya OWNER yang dapat menghapus kategori.');
+      }
+      if (!canDeleteCategory(currentUser.role, category.id, effectiveItems)) {
+        throw new Error(`Kategori "${category.name}" masih digunakan oleh data barang sehingga tidak dapat dihapus.`);
+      }
+      if (isSandbox) {
+        setSandboxState((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            categories: prev.categories.filter((c) => c.id !== category.id),
+            auditLogs: appendSandboxAudit(
+              prev,
+              currentUser,
+              'DELETE_CATEGORY',
+              'CATEGORY',
+              category.id,
+              `Menghapus kategori ${category.code} - ${category.name}.`
+            ),
+          };
+        });
+        return;
+      }
+      try {
+        await deleteDoc(doc(db, 'categories', category.id));
+      } catch (err) {
+        handleFirestoreError(err, OperationType.DELETE, `categories/${category.id}`);
+      }
+      await writeAuditLogFirestore(
+        currentUser,
+        'DELETE_CATEGORY',
+        'CATEGORY',
+        category.id,
+        `Menghapus kategori ${category.code} - ${category.name}.`
+      );
+    },
+    [appendSandboxAudit, currentUser, effectiveItems, isSandbox, writeAuditLogFirestore]
+  );
+
+  const deleteCategoriesBatch = useCallback(
+    async (targetCategories: Category[]): Promise<{ deletedCount: number; skipped: string[] }> => {
+      if (!currentUser || currentUser.role !== 'OWNER') {
+        throw new Error('Hanya OWNER yang dapat menghapus kategori.');
+      }
+      const { deletable, locked } = partitionDeletableCategories(currentUser.role, targetCategories, effectiveItems);
+      const skipped = locked.map((c) => `${c.code} (${c.name}): masih digunakan oleh data barang`);
+      if (deletable.length === 0) {
+        return { deletedCount: 0, skipped };
+      }
+
+      if (isSandbox) {
+        const deleteIds = new Set(deletable.map((c) => c.id));
+        const codesSummary = deletable.map((c) => c.code).join(', ').slice(0, 200);
+        setSandboxState((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            categories: prev.categories.filter((c) => !deleteIds.has(c.id)),
+            auditLogs: appendSandboxAudit(
+              prev,
+              currentUser,
+              'DELETE_CATEGORY',
+              'CATEGORY',
+              `batch_${Date.now()}`,
+              `Menghapus ${deletable.length} kategori terpilih (${codesSummary}).`
+            ),
+          };
+        });
+        return { deletedCount: deletable.length, skipped };
+      }
+
+      let deletedCount = 0;
+      for (const cat of deletable) {
+        try {
+          await deleteCategory(cat);
+          deletedCount++;
+        } catch (err) {
+          skipped.push(`${cat.code} (${cat.name}): ${err instanceof Error ? err.message : 'Gagal menghapus'}`);
+        }
+      }
+      return { deletedCount, skipped };
+    },
+    [appendSandboxAudit, currentUser, deleteCategory, effectiveItems, isSandbox]
+  );
+
+  const deleteUnit = useCallback(
+    async (unit: Unit) => {
+      if (!currentUser || currentUser.role !== 'OWNER') {
+        throw new Error('Hanya OWNER yang dapat menghapus satuan.');
+      }
+      if (!canDeleteUnit(currentUser.role, unit.id, effectiveItems)) {
+        throw new Error(`Satuan "${unit.name}" masih digunakan oleh data barang sehingga tidak dapat dihapus.`);
+      }
+      if (isSandbox) {
+        setSandboxState((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            units: prev.units.filter((u) => u.id !== unit.id),
+            auditLogs: appendSandboxAudit(
+              prev,
+              currentUser,
+              'DELETE_UNIT',
+              'UNIT',
+              unit.id,
+              `Menghapus satuan ${unit.code} - ${unit.name}.`
+            ),
+          };
+        });
+        return;
+      }
+      try {
+        await deleteDoc(doc(db, 'units', unit.id));
+      } catch (err) {
+        handleFirestoreError(err, OperationType.DELETE, `units/${unit.id}`);
+      }
+      await writeAuditLogFirestore(
+        currentUser,
+        'DELETE_UNIT',
+        'UNIT',
+        unit.id,
+        `Menghapus satuan ${unit.code} - ${unit.name}.`
+      );
+    },
+    [appendSandboxAudit, currentUser, effectiveItems, isSandbox, writeAuditLogFirestore]
+  );
+
+  const deleteUnitsBatch = useCallback(
+    async (targetUnits: Unit[]): Promise<{ deletedCount: number; skipped: string[] }> => {
+      if (!currentUser || currentUser.role !== 'OWNER') {
+        throw new Error('Hanya OWNER yang dapat menghapus satuan.');
+      }
+      const { deletable, locked } = partitionDeletableUnits(currentUser.role, targetUnits, effectiveItems);
+      const skipped = locked.map((u) => `${u.code} (${u.name}): masih digunakan oleh data barang`);
+      if (deletable.length === 0) {
+        return { deletedCount: 0, skipped };
+      }
+
+      if (isSandbox) {
+        const deleteIds = new Set(deletable.map((u) => u.id));
+        const codesSummary = deletable.map((u) => u.code).join(', ').slice(0, 200);
+        setSandboxState((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            units: prev.units.filter((u) => !deleteIds.has(u.id)),
+            auditLogs: appendSandboxAudit(
+              prev,
+              currentUser,
+              'DELETE_UNIT',
+              'UNIT',
+              `batch_${Date.now()}`,
+              `Menghapus ${deletable.length} satuan terpilih (${codesSummary}).`
+            ),
+          };
+        });
+        return { deletedCount: deletable.length, skipped };
+      }
+
+      let deletedCount = 0;
+      for (const unit of deletable) {
+        try {
+          await deleteUnit(unit);
+          deletedCount++;
+        } catch (err) {
+          skipped.push(`${unit.code} (${unit.name}): ${err instanceof Error ? err.message : 'Gagal menghapus'}`);
+        }
+      }
+      return { deletedCount, skipped };
+    },
+    [appendSandboxAudit, currentUser, deleteUnit, effectiveItems, isSandbox]
+  );
+
+  const deleteSupplier = useCallback(
+    async (supplier: Supplier) => {
+      if (!currentUser || currentUser.role !== 'OWNER') {
+        throw new Error('Hanya OWNER yang dapat menghapus supplier.');
+      }
+      if (!canDeleteSupplier(currentUser.role, supplier.id, effectiveItems, effectiveIncoming)) {
+        throw new Error(`Supplier "${supplier.name}" masih digunakan oleh data barang atau transaksi barang masuk sehingga tidak dapat dihapus.`);
+      }
+      if (isSandbox) {
+        setSandboxState((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            suppliers: prev.suppliers.filter((s) => s.id !== supplier.id),
+            auditLogs: appendSandboxAudit(
+              prev,
+              currentUser,
+              'DELETE_SUPPLIER',
+              'SUPPLIER',
+              supplier.id,
+              `Menghapus supplier ${supplier.code} - ${supplier.name}.`
+            ),
+          };
+        });
+        return;
+      }
+      try {
+        await deleteDoc(doc(db, 'suppliers', supplier.id));
+      } catch (err) {
+        handleFirestoreError(err, OperationType.DELETE, `suppliers/${supplier.id}`);
+      }
+      await writeAuditLogFirestore(
+        currentUser,
+        'DELETE_SUPPLIER',
+        'SUPPLIER',
+        supplier.id,
+        `Menghapus supplier ${supplier.code} - ${supplier.name}.`
+      );
+    },
+    [appendSandboxAudit, currentUser, effectiveIncoming, effectiveItems, isSandbox, writeAuditLogFirestore]
+  );
+
+  const deleteSuppliersBatch = useCallback(
+    async (targetSuppliers: Supplier[]): Promise<{ deletedCount: number; skipped: string[] }> => {
+      if (!currentUser || currentUser.role !== 'OWNER') {
+        throw new Error('Hanya OWNER yang dapat menghapus supplier.');
+      }
+      const { deletable, locked } = partitionDeletableSuppliers(
+        currentUser.role,
+        targetSuppliers,
+        effectiveItems,
+        effectiveIncoming
+      );
+      const skipped = locked.map((s) => `${s.code} (${s.name}): masih digunakan oleh data barang atau transaksi`);
+      if (deletable.length === 0) {
+        return { deletedCount: 0, skipped };
+      }
+
+      if (isSandbox) {
+        const deleteIds = new Set(deletable.map((s) => s.id));
+        const codesSummary = deletable.map((s) => s.code).join(', ').slice(0, 200);
+        setSandboxState((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            suppliers: prev.suppliers.filter((s) => !deleteIds.has(s.id)),
+            auditLogs: appendSandboxAudit(
+              prev,
+              currentUser,
+              'DELETE_SUPPLIER',
+              'SUPPLIER',
+              `batch_${Date.now()}`,
+              `Menghapus ${deletable.length} supplier terpilih (${codesSummary}).`
+            ),
+          };
+        });
+        return { deletedCount: deletable.length, skipped };
+      }
+
+      let deletedCount = 0;
+      for (const sup of deletable) {
+        try {
+          await deleteSupplier(sup);
+          deletedCount++;
+        } catch (err) {
+          skipped.push(`${sup.code} (${sup.name}): ${err instanceof Error ? err.message : 'Gagal menghapus'}`);
+        }
+      }
+      return { deletedCount, skipped };
+    },
+    [appendSandboxAudit, currentUser, deleteSupplier, effectiveIncoming, effectiveItems, isSandbox]
+  );
+
   // Master Item CRUD with Code & Barcode Uniqueness Locks
-  const saveItem = useCallback(
-    async (input: {
-      id?: string;
-      code: string;
-      barcode: string;
-      name: string;
-      categoryId: string;
-      specification: string;
-      unitId: string;
-      initialStock: number;
-      minStock: number;
-      purchasePrice: number;
-      supplierId: string;
-      active: boolean;
-    }) => {
+  const saveItemWithRefs = useCallback(
+    async (
+      input: {
+        id?: string;
+        code: string;
+        barcode: string;
+        name: string;
+        categoryId: string;
+        specification: string;
+        unitId: string;
+        initialStock: number;
+        minStock: number;
+        purchasePrice: number;
+        supplierId: string;
+        active: boolean;
+      },
+      refs?: {
+        category?: Category;
+        unit?: Unit;
+        supplier?: Supplier;
+        existingItems?: InventoryItem[];
+      }
+    ): Promise<InventoryItem> => {
       if (!currentUser || !canEditMasterItems(currentUser.role)) throw new Error('Akses ditolak.');
+      const existingItemsList = refs?.existingItems ?? effectiveItems;
       const uniqueness = validateItemUniqueness({
         code: input.code,
         barcode: input.barcode,
         editingItemId: input.id,
-        existingItems: effectiveItems,
+        existingItems: existingItemsList,
       });
       if (!uniqueness.valid) throw new Error(uniqueness.error);
 
-      const category = effectiveCategories.find((c) => c.id === input.categoryId);
-      const unit = effectiveUnits.find((u) => u.id === input.unitId);
-      const supplier = effectiveSuppliers.find((s) => s.id === input.supplierId);
+      const category = refs?.category ?? effectiveCategories.find((c) => c.id === input.categoryId);
+      const unit = refs?.unit ?? effectiveUnits.find((u) => u.id === input.unitId);
+      const supplier = refs?.supplier ?? effectiveSuppliers.find((s) => s.id === input.supplierId);
       if (!category || !unit || !supplier) throw new Error('Kategori, Satuan, dan Supplier wajib dipilih.');
 
       const id = input.id ?? sanitizeId(`item_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
       const nowIso = new Date().toISOString();
+      const normCode = input.code.trim().toUpperCase();
+      const normBarcode = input.barcode.trim().toUpperCase();
+      const existingSnapshot = existingItemsList.find((i) => i.id === id);
+      const resultItem: InventoryItem = existingSnapshot
+        ? {
+            ...existingSnapshot,
+            code: normCode,
+            barcode: normBarcode,
+            name: input.name.trim(),
+            categoryId: category.id,
+            categoryName: category.name,
+            specification: input.specification.trim(),
+            unitId: unit.id,
+            unitName: unit.name,
+            minStock: Number(input.minStock),
+            purchasePrice: Number(input.purchasePrice),
+            supplierId: supplier.id,
+            supplierName: supplier.name,
+            active: input.active,
+            updatedAt: nowIso,
+          }
+        : {
+            id,
+            code: normCode,
+            barcode: normBarcode,
+            name: input.name.trim(),
+            categoryId: category.id,
+            categoryName: category.name,
+            specification: input.specification.trim(),
+            unitId: unit.id,
+            unitName: unit.name,
+            initialStock: Number(input.initialStock),
+            currentStock: Number(input.initialStock),
+            minStock: Number(input.minStock),
+            purchasePrice: Number(input.purchasePrice),
+            supplierId: supplier.id,
+            supplierName: supplier.name,
+            active: input.active,
+            hasTransactions: false,
+            createdByUid: currentUser.uid,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          };
 
       if (isSandbox) {
         setSandboxState((prev) => {
@@ -1053,8 +1757,8 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
           const itemObj: InventoryItem = existing
             ? {
                 ...existing,
-                code: input.code.trim().toUpperCase(),
-                barcode: input.barcode.trim().toUpperCase(),
+                code: normCode,
+                barcode: normBarcode,
                 name: input.name.trim(),
                 categoryId: category.id,
                 categoryName: category.name,
@@ -1068,39 +1772,16 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
                 active: input.active,
                 updatedAt: nowIso,
               }
-            : {
-                id,
-                code: input.code.trim().toUpperCase(),
-                barcode: input.barcode.trim().toUpperCase(),
-                name: input.name.trim(),
-                categoryId: category.id,
-                categoryName: category.name,
-                specification: input.specification.trim(),
-                unitId: unit.id,
-                unitName: unit.name,
-                initialStock: Number(input.initialStock),
-                currentStock: Number(input.initialStock),
-                minStock: Number(input.minStock),
-                purchasePrice: Number(input.purchasePrice),
-                supplierId: supplier.id,
-                supplierName: supplier.name,
-                active: input.active,
-                hasTransactions: false,
-                createdByUid: currentUser.uid,
-                createdAt: nowIso,
-                updatedAt: nowIso,
-              };
+            : resultItem;
           return {
             ...prev,
             items: existing ? prev.items.map((i) => (i.id === id ? itemObj : i)) : [itemObj, ...prev.items],
             auditLogs: appendSandboxAudit(prev, currentUser, existing ? 'UPDATE_ITEM' : 'CREATE_ITEM', 'ITEM', id, `Barang ${itemObj.code} - ${itemObj.name}`),
           };
         });
-        return;
+        return resultItem;
       }
 
-      const normCode = input.code.trim().toUpperCase();
-      const normBarcode = input.barcode.trim().toUpperCase();
       const codeLockRef = doc(db, 'itemCodes', normalizeCodeKey(normCode));
       const barcodeLockRef = doc(db, 'itemBarcodes', normalizeCodeKey(normBarcode));
 
@@ -1121,14 +1802,23 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
 
         if (itemSnap.exists()) {
           const prev = itemSnap.data() as InventoryItem;
-          if (prev.code !== normCode) {
-            tx.delete(doc(db, 'itemCodes', normalizeCodeKey(prev.code)));
+          const prevCodeKey = normalizeCodeKey(prev.code);
+          const nextCodeKey = normalizeCodeKey(normCode);
+          if (prevCodeKey !== nextCodeKey) {
+            tx.delete(doc(db, 'itemCodes', prevCodeKey));
+            tx.set(codeLockRef, { itemId: id, value: normCode, createdAt: serverTimestamp() });
+          } else if (!codeSnap.exists()) {
+            tx.set(codeLockRef, { itemId: id, value: normCode, createdAt: serverTimestamp() });
           }
-          if (prev.barcode !== normBarcode) {
-            tx.delete(doc(db, 'itemBarcodes', normalizeCodeKey(prev.barcode)));
+
+          const prevBarcodeKey = normalizeCodeKey(prev.barcode);
+          const nextBarcodeKey = normalizeCodeKey(normBarcode);
+          if (prevBarcodeKey !== nextBarcodeKey) {
+            tx.delete(doc(db, 'itemBarcodes', prevBarcodeKey));
+            tx.set(barcodeLockRef, { itemId: id, value: normBarcode, createdAt: serverTimestamp() });
+          } else if (!barcodeSnap.exists()) {
+            tx.set(barcodeLockRef, { itemId: id, value: normBarcode, createdAt: serverTimestamp() });
           }
-          tx.set(codeLockRef, { itemId: id, value: normCode, createdAt: serverTimestamp() });
-          tx.set(barcodeLockRef, { itemId: id, value: normBarcode, createdAt: serverTimestamp() });
           tx.update(itemRef, {
             code: normCode,
             barcode: normBarcode,
@@ -1174,66 +1864,414 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
       });
 
       await writeAuditLogFirestore(currentUser, input.id ? 'UPDATE_ITEM' : 'CREATE_ITEM', 'ITEM', id, `Menyimpan barang ${normCode} (${input.name.trim()}).`);
+      return resultItem;
     },
     [appendSandboxAudit, currentUser, effectiveCategories, effectiveItems, effectiveSuppliers, effectiveUnits, isSandbox, writeAuditLogFirestore]
   );
 
+  const saveItem = useCallback(
+    async (input: {
+      id?: string;
+      code: string;
+      barcode: string;
+      name: string;
+      categoryId: string;
+      specification: string;
+      unitId: string;
+      initialStock: number;
+      minStock: number;
+      purchasePrice: number;
+      supplierId: string;
+      active: boolean;
+    }) => {
+      await saveItemWithRefs(input);
+    },
+    [saveItemWithRefs]
+  );
+
   const importItemsBatch = useCallback(
-    async (
-      rows: Array<{
-        code: string;
-        barcode: string;
-        name: string;
-        categoryName: string;
-        specification: string;
-        unitName: string;
-        initialStock: number;
-        minStock: number;
-        purchasePrice: number;
-        supplierName: string;
-      }>
-    ) => {
+    async (data: ParsedMasterDatabase): Promise<MasterDatabaseImportSummary> => {
       if (!currentUser || !canEditMasterItems(currentUser.role)) throw new Error('Akses ditolak.');
-      let imported = 0;
-      const skipped: string[] = [];
+      const canWriteUnits = canManageUnits(currentUser.role);
 
-      for (const row of rows) {
-        const cat =
-          effectiveCategories.find((c) => c.name.toLowerCase() === row.categoryName.toLowerCase()) ??
-          effectiveCategories[0];
-        const unit =
-          effectiveUnits.find((u) => u.name.toLowerCase() === row.unitName.toLowerCase()) ??
-          effectiveUnits[0];
-        const sup =
-          effectiveSuppliers.find((s) => s.name.toLowerCase() === row.supplierName.toLowerCase()) ??
-          effectiveSuppliers[0];
+      const summary: MasterDatabaseImportSummary = {
+        itemsCreated: 0,
+        itemsUpdated: 0,
+        categoriesCreated: 0,
+        categoriesUpdated: 0,
+        unitsCreated: 0,
+        unitsUpdated: 0,
+        suppliersCreated: 0,
+        suppliersUpdated: 0,
+        skipped: [],
+      };
 
-        if (!cat || !unit || !sup) {
-          skipped.push(`${row.code}: Master Kategori/Satuan/Supplier belum tersedia.`);
-          continue;
+      let workingCategories = [...effectiveCategories];
+      let workingUnits = [...effectiveUnits];
+      let workingSuppliers = [...effectiveSuppliers];
+      let workingItems = [...effectiveItems];
+
+      const findCategory = (code: string, name: string): Category | undefined => {
+        const normCode = code.trim().toUpperCase();
+        const normName = name.trim().toLowerCase();
+        if (normCode) {
+          const byCode = workingCategories.find((c) => c.code.trim().toUpperCase() === normCode);
+          if (byCode) return byCode;
         }
+        if (normName) {
+          return workingCategories.find((c) => c.name.trim().toLowerCase() === normName);
+        }
+        return undefined;
+      };
+
+      const findUnit = (code: string, name: string): Unit | undefined => {
+        const normCode = code.trim().toUpperCase();
+        const normName = name.trim().toLowerCase();
+        if (normCode) {
+          const byCode = workingUnits.find((u) => u.code.trim().toUpperCase() === normCode);
+          if (byCode) return byCode;
+        }
+        if (normName) {
+          return workingUnits.find((u) => u.name.trim().toLowerCase() === normName);
+        }
+        return undefined;
+      };
+
+      const findSupplier = (code: string, name: string): Supplier | undefined => {
+        const normCode = code.trim().toUpperCase();
+        const normName = name.trim().toLowerCase();
+        if (normCode) {
+          const byCode = workingSuppliers.find((s) => s.code.trim().toUpperCase() === normCode);
+          if (byCode) return byCode;
+        }
+        if (normName) {
+          return workingSuppliers.find((s) => s.name.trim().toLowerCase() === normName);
+        }
+        return undefined;
+      };
+
+      // 1. Synchronize Categories sheet
+      for (const catRow of data.categories) {
+        const cleanName = catRow.name.trim().slice(0, 100);
+        const cleanCode = catRow.code.trim().toUpperCase().slice(0, 32);
+        const cleanDesc = catRow.description.trim().slice(0, 300);
+        if (!cleanName) continue;
         try {
-          await saveItem({
-            code: row.code,
-            barcode: row.barcode || `IMS-${row.code}`,
-            name: row.name,
-            categoryId: cat.id,
-            specification: row.specification,
-            unitId: unit.id,
-            initialStock: Math.max(0, row.initialStock),
-            minStock: Math.max(0, row.minStock),
-            purchasePrice: Math.max(0, row.purchasePrice),
-            supplierId: sup.id,
-            active: true,
-          });
-          imported++;
+          const existing = findCategory(cleanCode, cleanName);
+          if (existing) {
+            const targetCode = cleanCode || existing.code;
+            const changed =
+              existing.code !== targetCode ||
+              existing.name !== cleanName ||
+              existing.description !== cleanDesc ||
+              existing.active !== catRow.active;
+            if (changed) {
+              const updated = await saveCategory({
+                id: existing.id,
+                code: targetCode,
+                name: cleanName,
+                description: cleanDesc,
+                active: catRow.active,
+              });
+              workingCategories = workingCategories.map((c) => (c.id === existing.id ? updated : c));
+              summary.categoriesUpdated++;
+            }
+          } else {
+            const finalCode =
+              cleanCode || generateSequentialMasterCode('KAT', workingCategories.map((c) => c.code));
+            const created = await saveCategory({
+              code: finalCode,
+              name: cleanName,
+              description: cleanDesc,
+              active: catRow.active,
+            });
+            workingCategories = [created, ...workingCategories];
+            summary.categoriesCreated++;
+          }
         } catch (err) {
-          skipped.push(`${row.code}: ${err instanceof Error ? err.message : 'Gagal impor'}`);
+          summary.skipped.push(
+            `Kategori "${cleanName}": ${err instanceof Error ? err.message : 'Gagal sinkronisasi'}`
+          );
         }
       }
-      return { imported, skipped };
+
+      // 2. Synchronize Units sheet
+      for (const unitRow of data.units) {
+        const cleanName = unitRow.name.trim().slice(0, 80);
+        const cleanCode = unitRow.code.trim().toUpperCase().slice(0, 24);
+        const cleanDesc = unitRow.description.trim().slice(0, 300);
+        if (!cleanName) continue;
+        try {
+          const existing = findUnit(cleanCode, cleanName);
+          if (existing) {
+            const targetCode = cleanCode || existing.code;
+            const changed =
+              existing.code !== targetCode ||
+              existing.name !== cleanName ||
+              existing.description !== cleanDesc ||
+              existing.active !== unitRow.active;
+            if (changed) {
+              if (!canWriteUnits) {
+                summary.skipped.push(`Satuan "${cleanName}": hanya OWNER yang dapat mengubah data satuan.`);
+                continue;
+              }
+              const updated = await saveUnit({
+                id: existing.id,
+                code: targetCode,
+                name: cleanName,
+                description: cleanDesc,
+                active: unitRow.active,
+              });
+              workingUnits = workingUnits.map((u) => (u.id === existing.id ? updated : u));
+              summary.unitsUpdated++;
+            }
+          } else {
+            if (!canWriteUnits) {
+              summary.skipped.push(`Satuan "${cleanName}": hanya OWNER yang dapat menambah satuan baru.`);
+              continue;
+            }
+            const finalCode =
+              cleanCode || generateUnitCodeFromName(cleanName, workingUnits.map((u) => u.code));
+            const created = await saveUnit({
+              code: finalCode,
+              name: cleanName,
+              description: cleanDesc,
+              active: unitRow.active,
+            });
+            workingUnits = [created, ...workingUnits];
+            summary.unitsCreated++;
+          }
+        } catch (err) {
+          summary.skipped.push(
+            `Satuan "${cleanName}": ${err instanceof Error ? err.message : 'Gagal sinkronisasi'}`
+          );
+        }
+      }
+
+      // 3. Synchronize Suppliers sheet
+      for (const supRow of data.suppliers) {
+        const cleanName = supRow.name.trim().slice(0, 140);
+        const cleanCode = supRow.code.trim().toUpperCase().slice(0, 32);
+        const cleanPic = supRow.contactPerson.trim().slice(0, 100);
+        const cleanPhone = supRow.phone.trim().slice(0, 40);
+        const cleanEmail = supRow.email.trim().slice(0, 160);
+        const cleanAddress = supRow.address.trim().slice(0, 400);
+        if (!cleanName) continue;
+        try {
+          const existing = findSupplier(cleanCode, cleanName);
+          if (existing) {
+            const targetCode = cleanCode || existing.code;
+            const changed =
+              existing.code !== targetCode ||
+              existing.name !== cleanName ||
+              existing.contactPerson !== cleanPic ||
+              existing.phone !== cleanPhone ||
+              existing.email !== cleanEmail ||
+              existing.address !== cleanAddress ||
+              existing.active !== supRow.active;
+            if (changed) {
+              const updated = await saveSupplier({
+                id: existing.id,
+                code: targetCode,
+                name: cleanName,
+                contactPerson: cleanPic,
+                phone: cleanPhone,
+                email: cleanEmail,
+                address: cleanAddress,
+                active: supRow.active,
+              });
+              workingSuppliers = workingSuppliers.map((s) => (s.id === existing.id ? updated : s));
+              summary.suppliersUpdated++;
+            }
+          } else {
+            const finalCode =
+              cleanCode || generateSequentialMasterCode('SUP', workingSuppliers.map((s) => s.code));
+            const created = await saveSupplier({
+              code: finalCode,
+              name: cleanName,
+              contactPerson: cleanPic,
+              phone: cleanPhone,
+              email: cleanEmail,
+              address: cleanAddress,
+              active: supRow.active,
+            });
+            workingSuppliers = [created, ...workingSuppliers];
+            summary.suppliersCreated++;
+          }
+        } catch (err) {
+          summary.skipped.push(
+            `Supplier "${cleanName}": ${err instanceof Error ? err.message : 'Gagal sinkronisasi'}`
+          );
+        }
+      }
+
+      // 4. Synchronize Items (auto-creating any inline referenced Category, Unit, or Supplier)
+      for (const row of data.items) {
+        const normCode = row.code.trim().toUpperCase().slice(0, 64);
+        const itemName = row.name.trim().slice(0, 180);
+        if (!normCode || !itemName) continue;
+
+        try {
+          let cat: Category | undefined;
+          if (row.categoryCode.trim() || row.categoryName.trim()) {
+            cat = findCategory(row.categoryCode, row.categoryName);
+            if (!cat) {
+              const newCatName = (row.categoryName.trim() || row.categoryCode.trim()).slice(0, 100);
+              const newCatCode =
+                row.categoryCode.trim().toUpperCase().slice(0, 32) ||
+                generateSequentialMasterCode('KAT', workingCategories.map((c) => c.code));
+              cat = await saveCategory({
+                code: newCatCode,
+                name: newCatName,
+                description: '',
+                active: true,
+              });
+              workingCategories = [cat, ...workingCategories];
+              summary.categoriesCreated++;
+            }
+          } else {
+            cat = workingCategories[0];
+          }
+
+          let unit: Unit | undefined;
+          if (row.unitCode.trim() || row.unitName.trim()) {
+            unit = findUnit(row.unitCode, row.unitName);
+            if (!unit) {
+              if (!canWriteUnits) {
+                summary.skipped.push(
+                  `${normCode}: Satuan "${row.unitName || row.unitCode}" belum terdaftar (hanya OWNER yang dapat menambah satuan baru).`
+                );
+                continue;
+              }
+              const newUnitName = (row.unitName.trim() || row.unitCode.trim()).slice(0, 80);
+              const newUnitCode =
+                row.unitCode.trim().toUpperCase().slice(0, 24) ||
+                generateUnitCodeFromName(newUnitName, workingUnits.map((u) => u.code));
+              unit = await saveUnit({
+                code: newUnitCode,
+                name: newUnitName,
+                description: '',
+                active: true,
+              });
+              workingUnits = [unit, ...workingUnits];
+              summary.unitsCreated++;
+            }
+          } else {
+            unit = workingUnits[0];
+          }
+
+          let sup: Supplier | undefined;
+          if (row.supplierCode.trim() || row.supplierName.trim()) {
+            sup = findSupplier(row.supplierCode, row.supplierName);
+            if (!sup) {
+              const newSupName = (row.supplierName.trim() || row.supplierCode.trim()).slice(0, 140);
+              const newSupCode =
+                row.supplierCode.trim().toUpperCase().slice(0, 32) ||
+                generateSequentialMasterCode('SUP', workingSuppliers.map((s) => s.code));
+              sup = await saveSupplier({
+                code: newSupCode,
+                name: newSupName,
+                contactPerson: '',
+                phone: '',
+                email: '',
+                address: '',
+                active: true,
+              });
+              workingSuppliers = [sup, ...workingSuppliers];
+              summary.suppliersCreated++;
+            }
+          } else {
+            sup = workingSuppliers[0];
+          }
+
+          if (!cat || !unit || !sup) {
+            summary.skipped.push(`${normCode}: Master Kategori/Satuan/Supplier belum tersedia.`);
+            continue;
+          }
+
+          const existingItem = workingItems.find((i) => i.code.trim().toUpperCase() === normCode);
+          const normBarcode = (row.barcode.trim() || existingItem?.barcode || `IMS-${normCode}`)
+            .toUpperCase()
+            .slice(0, 64);
+          const cleanSpec = row.specification.trim().slice(0, 500);
+          const cleanMinStock = Math.max(0, Number(row.minStock) || 0);
+          const cleanPrice = Math.max(0, Number(row.purchasePrice) || 0);
+
+          if (existingItem) {
+            const changed =
+              existingItem.barcode !== normBarcode ||
+              existingItem.name !== itemName ||
+              existingItem.categoryId !== cat.id ||
+              existingItem.categoryName !== cat.name ||
+              existingItem.specification !== cleanSpec ||
+              existingItem.unitId !== unit.id ||
+              existingItem.unitName !== unit.name ||
+              existingItem.minStock !== cleanMinStock ||
+              existingItem.purchasePrice !== cleanPrice ||
+              existingItem.supplierId !== sup.id ||
+              existingItem.supplierName !== sup.name ||
+              existingItem.active !== row.active;
+            if (changed) {
+              const updatedItem = await saveItemWithRefs(
+                {
+                  id: existingItem.id,
+                  code: normCode,
+                  barcode: normBarcode,
+                  name: itemName,
+                  categoryId: cat.id,
+                  specification: cleanSpec,
+                  unitId: unit.id,
+                  initialStock: existingItem.initialStock,
+                  minStock: cleanMinStock,
+                  purchasePrice: cleanPrice,
+                  supplierId: sup.id,
+                  active: row.active,
+                },
+                { category: cat, unit, supplier: sup, existingItems: workingItems }
+              );
+              workingItems = workingItems.map((i) => (i.id === existingItem.id ? updatedItem : i));
+              summary.itemsUpdated++;
+            }
+          } else {
+            const createdItem = await saveItemWithRefs(
+              {
+                code: normCode,
+                barcode: normBarcode,
+                name: itemName,
+                categoryId: cat.id,
+                specification: cleanSpec,
+                unitId: unit.id,
+                initialStock: Math.max(0, Number(row.initialStock) || 0),
+                minStock: cleanMinStock,
+                purchasePrice: cleanPrice,
+                supplierId: sup.id,
+                active: row.active,
+              },
+              { category: cat, unit, supplier: sup, existingItems: workingItems }
+            );
+            workingItems = [createdItem, ...workingItems];
+            summary.itemsCreated++;
+          }
+        } catch (err) {
+          summary.skipped.push(
+            `${normCode}: ${err instanceof Error ? err.message : 'Gagal impor'}`
+          );
+        }
+      }
+
+      return summary;
     },
-    [currentUser, effectiveCategories, effectiveSuppliers, effectiveUnits, saveItem]
+    [
+      currentUser,
+      effectiveCategories,
+      effectiveItems,
+      effectiveSuppliers,
+      effectiveUnits,
+      saveCategory,
+      saveItemWithRefs,
+      saveSupplier,
+      saveUnit,
+    ]
   );
 
   const deleteItemPermanently = useCallback(
@@ -1266,6 +2304,54 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
       await writeAuditLogFirestore(currentUser, 'DELETE_ITEM', 'ITEM', item.id, `Menghapus permanen barang ${item.code} - ${item.name}.`);
     },
     [appendSandboxAudit, currentUser, isSandbox, writeAuditLogFirestore]
+  );
+
+  const deleteItemsBatch = useCallback(
+    async (targetItems: InventoryItem[]): Promise<{ deletedCount: number; skipped: string[] }> => {
+      if (!currentUser || currentUser.role !== 'OWNER') {
+        throw new Error('Hanya OWNER yang dapat menghapus master barang permanen.');
+      }
+      const { deletable, locked } = partitionDeletableItems(currentUser.role, targetItems);
+      const skipped = locked.map((i) => `${i.code} (${i.name}): memiliki riwayat transaksi`);
+      if (deletable.length === 0) {
+        return { deletedCount: 0, skipped };
+      }
+
+      if (isSandbox) {
+        const deleteIds = new Set(deletable.map((i) => i.id));
+        const codesSummary = deletable.map((i) => i.code).join(', ').slice(0, 200);
+        setSandboxState((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            items: prev.items.filter((i) => !deleteIds.has(i.id)),
+            auditLogs: appendSandboxAudit(
+              prev,
+              currentUser,
+              'DELETE_ITEM',
+              'ITEM',
+              `batch_${Date.now()}`,
+              `Menghapus permanen ${deletable.length} barang terpilih (${codesSummary})`
+            ),
+          };
+        });
+        return { deletedCount: deletable.length, skipped };
+      }
+
+      let deletedCount = 0;
+      for (const item of deletable) {
+        try {
+          await deleteItemPermanently(item);
+          deletedCount++;
+        } catch (err) {
+          skipped.push(
+            `${item.code} (${item.name}): ${err instanceof Error ? err.message : 'Gagal menghapus'}`
+          );
+        }
+      }
+      return { deletedCount, skipped };
+    },
+    [appendSandboxAudit, currentUser, deleteItemPermanently, isSandbox]
   );
 
   // Incoming Transactions
@@ -1756,6 +2842,30 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
     [appendSandboxAudit, currentUser, isSandbox, writeAuditLogFirestore]
   );
 
+  const deleteStockRequest = useCallback(
+    async (request: StockRequest) => {
+      if (!currentUser) throw new Error('Belum login.');
+      const hasDeliveries = effectiveDeliveries.some((d) => d.requestId === request.id);
+      if (!canDeleteStockRequest(currentUser.role, request, currentUser.uid, hasDeliveries)) {
+        throw new Error('Permintaan yang sudah memiliki penyerahan barang atau di luar hak akses Anda tidak dapat dihapus.');
+      }
+      if (isSandbox) {
+        setSandboxState((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            requests: prev.requests.filter((r) => r.id !== request.id),
+            auditLogs: appendSandboxAudit(prev, currentUser, 'DELETE_REQUEST', 'REQUEST', request.id, `Menghapus permintaan ${request.requestNumber}`),
+          };
+        });
+        return;
+      }
+      await deleteDoc(doc(db, 'stockRequests', request.id));
+      await writeAuditLogFirestore(currentUser, 'DELETE_REQUEST', 'REQUEST', request.id, `Menghapus permintaan ${request.requestNumber}.`);
+    },
+    [appendSandboxAudit, currentUser, effectiveDeliveries, isSandbox, writeAuditLogFirestore]
+  );
+
   const confirmStockDelivery = useCallback(
     async (input: { request: StockRequest; deliverQuantities: Record<string, number>; notes: string }) => {
       if (!currentUser || !canApproveOrDeliver(currentUser.role)) throw new Error('Akses ditolak.');
@@ -2020,20 +3130,95 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
     async (notif: NotificationItem) => {
       if (!currentUser || notif.readBy.includes(currentUser.uid)) return;
       const nextRead = [...notif.readBy, currentUser.uid].slice(0, 50);
+      const readAtIso = new Date().toISOString();
+      setNotifNowMs(Date.now());
       if (isSandbox) {
         setSandboxState((prev) => {
           if (!prev) return prev;
           return {
             ...prev,
-            notifications: prev.notifications.map((n) => (n.id === notif.id ? { ...n, readBy: nextRead } : n)),
+            notifications: prev.notifications.map((n) =>
+              n.id === notif.id
+                ? {
+                    ...n,
+                    readBy: nextRead,
+                    readAtBy: { ...(n.readAtBy ?? {}), [currentUser.uid]: readAtIso },
+                  }
+                : n
+            ),
           };
         });
         return;
       }
-      await updateDoc(doc(db, 'notifications', notif.id), { readBy: nextRead });
+      try {
+        await updateDoc(doc(db, 'notifications', notif.id), {
+          readBy: nextRead,
+          [`readAtBy.${currentUser.uid}`]: serverTimestamp(),
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `notifications/${notif.id}`);
+      }
     },
     [currentUser, isSandbox]
   );
+
+  const deleteNotification = useCallback(
+    async (notif: NotificationItem) => {
+      if (!currentUser) throw new Error('Belum login.');
+      if (!canDeleteNotification(currentUser.role, notif, currentUser.uid)) {
+        throw new Error('Anda tidak memiliki izin untuk menghapus notifikasi ini.');
+      }
+      if (isSandbox) {
+        setSandboxState((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            notifications: prev.notifications.filter((n) => n.id !== notif.id),
+          };
+        });
+        return;
+      }
+      try {
+        await deleteDoc(doc(db, 'notifications', notif.id));
+      } catch (err) {
+        handleFirestoreError(err, OperationType.DELETE, `notifications/${notif.id}`);
+      }
+    },
+    [currentUser, isSandbox]
+  );
+
+  const deleteAllNotifications = useCallback(async () => {
+    if (!currentUser) throw new Error('Belum login.');
+    const deletable = effectiveNotifications.filter((n) =>
+      canDeleteNotification(currentUser.role, n, currentUser.uid)
+    );
+    if (deletable.length === 0) return;
+
+    const deletableIds = new Set(deletable.map((n) => n.id));
+    if (isSandbox) {
+      setSandboxState((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          notifications: prev.notifications.filter((n) => !deletableIds.has(n.id)),
+        };
+      });
+      return;
+    }
+
+    try {
+      for (let i = 0; i < deletable.length; i += 450) {
+        const chunk = deletable.slice(i, i + 450);
+        const batch = writeBatch(db);
+        for (const notif of chunk) {
+          batch.delete(doc(db, 'notifications', notif.id));
+        }
+        await batch.commit();
+      }
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, 'notifications');
+    }
+  }, [currentUser, effectiveNotifications, isSandbox]);
 
   const updateSystemSettings = useCallback(
     async (input: { companyName: string; lowStockAlertEnabled: boolean }) => {
@@ -2128,21 +3313,35 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
     logout,
     saveUserInvite,
     updateUserAccountRoleOrStatus,
+    deleteUserAccount,
+    deleteUserInvite,
+    deleteAllNonOwnerUsers,
     saveCategory,
+    deleteCategory,
+    deleteCategoriesBatch,
     saveUnit,
+    deleteUnit,
+    deleteUnitsBatch,
     saveSupplier,
+    deleteSupplier,
+    deleteSuppliersBatch,
     saveItem,
     importItemsBatch,
     deleteItemPermanently,
+    deleteItemsBatch,
     saveIncomingDraft,
     confirmIncomingTransaction,
     reverseIncomingTransaction,
     submitStockRequest,
     reviewRequest,
     cancelRequest,
+    deleteStockRequest,
     confirmStockDelivery,
     submitStockAdjustment,
+    notifNowMs,
     markNotificationAsRead,
+    deleteNotification,
+    deleteAllNotifications,
     updateSystemSettings,
     exportBackupJson,
     seedStarterMasters,

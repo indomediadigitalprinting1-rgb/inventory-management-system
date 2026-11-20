@@ -117,7 +117,7 @@ export function LoginView() {
               <div className="space-y-1.5">
                 <h2 className="font-display text-2xl font-bold text-slate-900">Masuk ke Sistem</h2>
                 <p className="text-sm text-slate-600">
-                  Gunakan akun yang telah diotorisasi oleh Owner perusahaan.
+                  Masuk menggunakan akun Google terotorisasi atau email &amp; kata sandi terdaftar.
                 </p>
               </div>
 
@@ -125,7 +125,7 @@ export function LoginView() {
                 <button
                   type="button"
                   onClick={() => setMode('google')}
-                  className={`flex-1 px-3 py-2 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+                  className={`flex-1 px-3 py-2 text-xs font-medium rounded-md transition-colors ${
                     mode === 'google' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
@@ -134,7 +134,7 @@ export function LoginView() {
                 <button
                   type="button"
                   onClick={() => setMode('email')}
-                  className={`flex-1 px-3 py-2 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+                  className={`flex-1 px-3 py-2 text-xs font-medium rounded-md transition-colors ${
                     mode === 'email' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
@@ -161,7 +161,7 @@ export function LoginView() {
                     Masuk dengan Google
                   </button>
                   <p className="text-xs text-slate-500 leading-relaxed">
-                    Login pertama kali pada sistem baru akan membuka proses inisialisasi akun Owner utama secara aman.
+                    Login pertama kali pada sistem baru akan membuka proses inisialisasi akun Owner utama secara aman. Pengguna Admin &amp; Produksi harus diotorisasi terlebih dahulu oleh Owner.
                   </p>
                 </div>
               ) : (
@@ -195,7 +195,7 @@ export function LoginView() {
                         required
                         value={password}
                         onChange={(e) => setPassword(e.target.value)}
-                        placeholder="Masukkan kata sandi"
+                        placeholder="••••••••"
                         className="w-full pl-9 pr-3 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-red-800/20 focus:border-red-800"
                       />
                     </div>
@@ -319,7 +319,7 @@ export function LoginView() {
               <p className="text-sm text-slate-600">
                 {authStage === 'INACTIVE_ACCOUNT'
                   ? `Akun ${firebaseUser?.email} berstatus nonaktif. Hubungi Owner perusahaan untuk mengaktifkan kembali.`
-                  : `Email ${firebaseUser?.email} belum terdaftar di daftar otorisasi pengguna. Minta Owner menambahkan email Anda pada menu Pengguna dengan role ADMIN atau PRODUKSI.`}
+                  : `Email ${firebaseUser?.email} belum diotorisasi oleh Owner. Minta Owner menambahkan email Anda pada menu Pengguna.`}
               </p>
               <button
                 type="button"

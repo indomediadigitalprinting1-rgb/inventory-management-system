@@ -1,7 +1,13 @@
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import * as XLSX from 'xlsx';
-import type { DeliveryRecord, IncomingTransaction, InventoryItem } from '../domain/types';
+import type { Category, DeliveryRecord, IncomingTransaction, InventoryItem, Supplier, Unit } from '../domain/types';
+import {
+  buildMasterDatabaseWorkbook,
+  parseMasterDatabaseWorkbook,
+  type ImportedItemRow,
+  type ParsedMasterDatabase,
+} from '../domain/masterExcel';
 
 export function exportTableToExcel(
   filename: string,
@@ -134,82 +140,32 @@ export function exportDeliveryProofPdf(delivery: DeliveryRecord, companyName: st
   pdf.save(`bukti-penyerahan-${delivery.deliveryNumber}.pdf`);
 }
 
-export interface ImportedItemRow {
-  code: string;
-  barcode: string;
-  name: string;
-  categoryName: string;
-  specification: string;
-  unitName: string;
-  initialStock: number;
-  minStock: number;
-  purchasePrice: number;
-  supplierName: string;
+export type { ImportedItemRow, ParsedMasterDatabase };
+
+export async function parseMasterDatabaseFromExcel(file: File): Promise<ParsedMasterDatabase> {
+  const buffer = await file.arrayBuffer();
+  const workbook = XLSX.read(buffer, { type: 'array' });
+  return parseMasterDatabaseWorkbook(workbook);
 }
 
 export async function parseItemsFromExcel(file: File): Promise<ImportedItemRow[]> {
-  const buffer = await file.arrayBuffer();
-  const workbook = XLSX.read(buffer, { type: 'array' });
-  const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-  const rawRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(firstSheet, { defval: '' });
-
-  return rawRows
-    .map((row) => {
-      const getVal = (keys: string[]) => {
-        for (const k of keys) {
-          const found = Object.keys(row).find((rk) => rk.trim().toLowerCase() === k.toLowerCase());
-          if (found !== undefined && String(row[found]).trim() !== '') {
-            return String(row[found]).trim();
-          }
-        }
-        return '';
-      };
-      return {
-        code: getVal(['Kode Barang', 'Kode', 'code']),
-        barcode: getVal(['Barcode', 'barcode']),
-        name: getVal(['Nama Barang', 'Nama', 'name']),
-        categoryName: getVal(['Kategori', 'category', 'categoryName']),
-        specification: getVal(['Spesifikasi', 'specification']),
-        unitName: getVal(['Satuan', 'unit', 'unitName']),
-        initialStock: Number(getVal(['Stok Awal', 'Stok', 'initialStock']) || 0),
-        minStock: Number(getVal(['Stok Minimum', 'Min Stok', 'minStock']) || 0),
-        purchasePrice: Number(getVal(['Harga Pembelian', 'Harga', 'purchasePrice']) || 0),
-        supplierName: getVal(['Supplier Utama', 'Supplier', 'supplierName']),
-      };
-    })
-    .filter((r) => r.code && r.name);
+  const parsed = await parseMasterDatabaseFromExcel(file);
+  return parsed.items;
 }
 
-export function exportItemsMasterExcel(items: InventoryItem[], includePrice: boolean): void {
-  const columns = [
-    'Kode Barang',
-    'Barcode',
-    'Nama Barang',
-    'Kategori',
-    'Spesifikasi',
-    'Satuan',
-    'Stok Awal',
-    'Stok Saat Ini',
-    'Stok Minimum',
-    ...(includePrice ? ['Harga Pembelian'] : []),
-    'Supplier Utama',
-    'Status',
-  ];
-
-  const rows = items.map((i) => [
-    i.code,
-    i.barcode,
-    i.name,
-    i.categoryName,
-    i.specification,
-    i.unitName,
-    i.initialStock,
-    i.currentStock,
-    i.minStock,
-    ...(includePrice ? [i.purchasePrice] : []),
-    i.supplierName,
-    i.active ? 'Aktif' : 'Nonaktif',
-  ]);
-
-  exportTableToExcel(`master-barang-${new Date().toISOString().slice(0, 10)}`, 'Master Barang', columns, rows);
+export function exportItemsMasterExcel(
+  items: InventoryItem[],
+  categories: Category[],
+  units: Unit[],
+  suppliers: Supplier[],
+  includePrice: boolean
+): void {
+  const wb = buildMasterDatabaseWorkbook({
+    items,
+    categories,
+    units,
+    suppliers,
+    includePrice,
+  });
+  XLSX.writeFile(wb, `master-database-${new Date().toISOString().slice(0, 10)}.xlsx`);
 }

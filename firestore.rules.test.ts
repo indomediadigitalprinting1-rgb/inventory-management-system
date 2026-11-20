@@ -37,6 +37,15 @@ test('firestore.rules enforces global deny, blueprint collection coverage, and D
   assert.match(rules, /match \/deliveries\/\{deliveryId\}/);
   assert.match(rules, /match \/stockAdjustments\/\{adjId\}/);
 
+  // Notifications support readAtBy timestamp tracking and scoped deletion
+  assert.match(rules, /match \/notifications\/\{notifId\}[\s\S]*readAtBy[\s\S]*allow delete:/);
+
+  // Only Owner can delete non-owner users (never self or another OWNER) and invites
+  assert.match(rules, /match \/users\/\{userId\}[\s\S]*allow delete: if isOwner\(\)[\s\S]*userId != request\.auth\.uid[\s\S]*existing\(\)\.role != 'OWNER'/);
+  assert.match(rules, /match \/userInvites\/\{inviteId\}[\s\S]*allow delete: if isOwner\(\)/);
+  assert.ok(!rules.includes('isStaffPasswordAccount'), 'Username+password bypass should be removed');
+  assert.ok(!rules.includes('match /usernames/'), '/usernames collection should be removed');
+
   // Ensure every top-level collection in blueprint is matched in firestore.rules
   const collections = Object.keys(blueprint.firestore).map((p) => p.split('/')[1]);
   for (const col of new Set(collections)) {

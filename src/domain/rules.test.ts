@@ -5,16 +5,32 @@ import {
   applyStockAdjustment,
   canAccessRoute,
   canAdjustStock,
+  canDeleteCategory,
   canDeleteItemPermanently,
+  canDeleteNotification,
+  canDeleteSupplier,
+  canDeleteUnit,
   createIncomingReversal,
+  filterVisibleNotifications,
+  generateNextSequentialCode,
+  getNonOwnerUsers,
+  getRemainingReadMinutes,
+  isNotificationExpired,
+  partitionDeletableCategories,
+  partitionDeletableItems,
+  partitionDeletableSuppliers,
+  partitionDeletableUnits,
   processStockDelivery,
+  READ_NOTIFICATION_TTL_MS,
   reviewStockRequest,
+  sortItemsByCode,
   validateAdminSlotAvailability,
   validateItemUniqueness,
 } from './rules';
 import type {
   IncomingTransaction,
   InventoryItem,
+  NotificationItem,
   StockRequest,
   UserAccount,
   UserInvite,
@@ -421,3 +437,201 @@ test('Owner stock adjustment works and rejects non-owners or negative balances',
   assert.equal(res.ledgerEntry.qtyIn, 4);
   assert.equal(res.ledgerEntry.balanceAfter, 14);
 });
+
+test('Read notifications expire exactly 30 minutes after being read while unread stay visible', () => {
+  const createdAt = '2026-11-18T08:00:00.000Z';
+  const readAtOwner = '2026-11-18T10:00:00.000Z';
+  const readAtMs = Date.parse(readAtOwner);
+
+  const unreadNotif: NotificationItem = {
+    id: 'n_unread',
+    targetRole: 'OWNER',
+    type: 'LOW_STOCK',
+    title: 'Stok Minimum',
+    message: 'Kabel hampir habis',
+    readBy: [],
+    createdAt,
+  };
+
+  const readNotif: NotificationItem = {
+    id: 'n_read',
+    targetRole: 'ADMIN',
+    type: 'NEW_REQUEST',
+    title: 'Permintaan Baru',
+    message: 'Permintaan masuk',
+    readBy: ['uid_owner'],
+    readAtBy: { uid_owner: readAtOwner },
+    createdAt,
+  };
+
+  // Even 3 hours after creation, unread notifications never expire
+  assert.equal(isNotificationExpired(unreadNotif, 'uid_owner', readAtMs + 180 * 60 * 1000), false);
+  assert.equal(getRemainingReadMinutes(unreadNotif, 'uid_owner', readAtMs), null);
+
+  // At 29m59s after readAt, read notification is still visible
+  const beforeExpiryMs = readAtMs + READ_NOTIFICATION_TTL_MS - 1000;
+  assert.equal(isNotificationExpired(readNotif, 'uid_owner', beforeExpiryMs), false);
+  assert.equal(getRemainingReadMinutes(readNotif, 'uid_owner', beforeExpiryMs), 1);
+
+  // At exactly 30m00s after readAt, read notification disappears for uid_owner
+  const atExpiryMs = readAtMs + READ_NOTIFICATION_TTL_MS;
+  assert.equal(isNotificationExpired(readNotif, 'uid_owner', atExpiryMs), true);
+  assert.equal(getRemainingReadMinutes(readNotif, 'uid_owner', atExpiryMs), 0);
+
+  // Another user who has NOT read the same notification still sees it
+  assert.equal(isNotificationExpired(readNotif, 'uid_admin', atExpiryMs), false);
+
+  const visibleForOwner = filterVisibleNotifications([unreadNotif, readNotif], 'uid_owner', atExpiryMs);
+  assert.deepEqual(
+    visibleForOwner.map((n) => n.id),
+    ['n_unread']
+  );
+
+  // RBAC check for notification deletion
+  assert.equal(canDeleteNotification('OWNER', readNotif, 'uid_owner'), true);
+  assert.equal(canDeleteNotification('ADMIN', readNotif, 'uid_admin'), true);
+  assert.equal(canDeleteNotification('ADMIN', unreadNotif, 'uid_admin'), false);
+  assert.equal(
+    canDeleteNotification('PRODUKSI', { targetRole: 'PRODUKSI', targetUid: 'uid_prod_1' }, 'uid_prod_1'),
+    true
+  );
+  assert.equal(
+    canDeleteNotification('PRODUKSI', { targetRole: 'PRODUKSI', targetUid: 'uid_prod_2' }, 'uid_prod_1'),
+    false
+  );
+});
+
+test('generateNextSequentialCode continues sequentially past max code even after middle deletions', () => {
+  assert.equal(generateNextSequentialCode('BRG', [], 3), 'BRG-001');
+
+  // Simulate 40 items (BRG-001..BRG-040) where BRG-039 was deleted -> 39 items left, max is BRG-040
+  const afterDelete39 = Array.from({ length: 40 }, (_, i) => `BRG-${String(i + 1).padStart(3, '0')}`).filter(
+    (code) => code !== 'BRG-039'
+  );
+  assert.equal(afterDelete39.length, 39);
+  assert.equal(generateNextSequentialCode('BRG', afterDelete39, 3), 'BRG-041');
+
+  // Case-insensitive and ignores non-numeric or unrelated codes
+  assert.equal(
+    generateNextSequentialCode('KAT', ['KAT-LGM', 'kat-02', 'KAT-05', 'KAT-ELK'], 2),
+    'KAT-06'
+  );
+  assert.equal(generateNextSequentialCode('SUP', ['SUP-01', 'SUP-03'], 2), 'SUP-04');
+});
+
+test('partitionDeletableItems separates deletable items from items with transaction history or non-OWNER role', () => {
+  const cleanA = makeItem({ id: 'a', code: 'BRG-001', hasTransactions: false });
+  const txB = makeItem({ id: 'b', code: 'BRG-002', hasTransactions: true });
+  const cleanC = makeItem({ id: 'c', code: 'BRG-003', hasTransactions: false });
+
+  const ownerSplit = partitionDeletableItems('OWNER', [cleanA, txB, cleanC]);
+  assert.deepEqual(
+    ownerSplit.deletable.map((i) => i.id),
+    ['a', 'c']
+  );
+  assert.deepEqual(
+    ownerSplit.locked.map((i) => i.id),
+    ['b']
+  );
+
+  const adminSplit = partitionDeletableItems('ADMIN', [cleanA, txB, cleanC]);
+  assert.equal(adminSplit.deletable.length, 0);
+  assert.equal(adminSplit.locked.length, 3);
+});
+
+test('sortItemsByCode orders old and newly imported items naturally ascending by code', () => {
+  const unsorted = [
+    { code: 'BRG-040', name: 'Empat Puluh' },
+    { code: 'SYNC-002', name: 'Sync Dua' },
+    { code: 'BRG-002', name: 'Dua' },
+    { code: 'BRG-10', name: 'Sepuluh' },
+    { code: 'BRG-001', name: 'Satu' },
+    { code: 'SYNC-001', name: 'Sync Satu' },
+    { code: 'BRG-039', name: 'Tiga Sembilan' },
+  ];
+  const sorted = sortItemsByCode(unsorted);
+  assert.deepEqual(
+    sorted.map((i) => i.code),
+    ['BRG-001', 'BRG-002', 'BRG-10', 'BRG-039', 'BRG-040', 'SYNC-001', 'SYNC-002']
+  );
+});
+
+test('getNonOwnerUsers filters out OWNER accounts cleanly', () => {
+  const mixedUsers: UserAccount[] = [
+    {
+      uid: 'u1',
+      email: 'owner@pabrik.id',
+      name: 'Owner',
+      role: 'OWNER',
+      department: 'Direksi',
+      active: true,
+      createdAt: '2026-11-01T00:00:00Z',
+      updatedAt: '2026-11-01T00:00:00Z',
+    },
+    {
+      uid: 'u2',
+      email: 'admin@pabrik.id',
+      name: 'Admin',
+      role: 'ADMIN',
+      department: 'Gudang',
+      active: true,
+      createdAt: '2026-11-01T00:00:00Z',
+      updatedAt: '2026-11-01T00:00:00Z',
+    },
+    {
+      uid: 'u3',
+      email: 'prod1@pabrik.id',
+      name: 'Prod 1',
+      role: 'PRODUKSI',
+      department: 'Line A',
+      active: true,
+      createdAt: '2026-11-01T00:00:00Z',
+      updatedAt: '2026-11-01T00:00:00Z',
+    },
+  ];
+  assert.deepEqual(
+    getNonOwnerUsers(mixedUsers).map((u) => u.uid),
+    ['u2', 'u3']
+  );
+});
+
+test('Category, unit, and supplier deletion guards enforce OWNER role and block records still referenced', () => {
+  const items = [makeItem({ categoryId: 'cat_used', unitId: 'unit_used', supplierId: 'sup_item' })];
+  const incoming = [{ supplierId: 'sup_tx' }];
+
+  const cats = [
+    { id: 'cat_used', code: 'KAT-01', name: 'Logam' },
+    { id: 'cat_free', code: 'KAT-02', name: 'Lainnya' },
+  ];
+  assert.equal(canDeleteCategory('OWNER', 'cat_used', items), false);
+  assert.equal(canDeleteCategory('OWNER', 'cat_free', items), true);
+  assert.equal(canDeleteCategory('ADMIN', 'cat_free', items), false);
+  const catSplit = partitionDeletableCategories('OWNER', cats, items);
+  assert.deepEqual(catSplit.deletable.map((c) => c.id), ['cat_free']);
+  assert.deepEqual(catSplit.locked.map((c) => c.id), ['cat_used']);
+
+  const units = [
+    { id: 'unit_used', code: 'LBR', name: 'Lembar' },
+    { id: 'unit_free', code: 'ROLL', name: 'Roll' },
+  ];
+  assert.equal(canDeleteUnit('OWNER', 'unit_used', items), false);
+  assert.equal(canDeleteUnit('OWNER', 'unit_free', items), true);
+  assert.equal(canDeleteUnit('PRODUKSI', 'unit_free', items), false);
+  const unitSplit = partitionDeletableUnits('OWNER', units, items);
+  assert.deepEqual(unitSplit.deletable.map((u) => u.id), ['unit_free']);
+  assert.deepEqual(unitSplit.locked.map((u) => u.id), ['unit_used']);
+
+  const suppliers = [
+    { id: 'sup_item', code: 'SUP-01', name: 'Dipakai Barang' },
+    { id: 'sup_tx', code: 'SUP-02', name: 'Dipakai Transaksi' },
+    { id: 'sup_free', code: 'SUP-03', name: 'Tidak Dipakai' },
+  ];
+  assert.equal(canDeleteSupplier('OWNER', 'sup_item', items, incoming), false);
+  assert.equal(canDeleteSupplier('OWNER', 'sup_tx', items, incoming), false);
+  assert.equal(canDeleteSupplier('OWNER', 'sup_free', items, incoming), true);
+  assert.equal(canDeleteSupplier('ADMIN', 'sup_free', items, incoming), false);
+  const supSplit = partitionDeletableSuppliers('OWNER', suppliers, items, incoming);
+  assert.deepEqual(supSplit.deletable.map((s) => s.id), ['sup_free']);
+  assert.deepEqual(supSplit.locked.map((s) => s.id), ['sup_item', 'sup_tx']);
+});
+

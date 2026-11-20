@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { CheckCircle2, ClipboardPlus, Eye, Plus, Search, Trash2, X, XCircle } from 'lucide-react';
-import { canApproveOrDeliver } from '../domain/rules';
+import { canApproveOrDeliver, canDeleteStockRequest } from '../domain/rules';
 import type { StockRequest } from '../domain/types';
 import { useInventory } from '../services/inventoryContext';
 import { RequestStatusLabel } from '../components/StatusText';
@@ -16,6 +16,7 @@ export function StockRequestsPage() {
     submitStockRequest,
     reviewRequest,
     cancelRequest,
+    deleteStockRequest,
     setActiveRoute,
   } = useInventory();
 
@@ -35,6 +36,7 @@ export function StockRequestsPage() {
   // Review State
   const [approvedQtyMap, setApprovedQtyMap] = useState<Record<string, number>>({});
   const [rejectionReason, setRejectionReason] = useState('');
+  const [deleteTarget, setDeleteTarget] = useState<StockRequest | null>(null);
   const [busy, setBusy] = useState(false);
 
   // Auto-populate from barcode scanner draft cart if present
@@ -158,6 +160,22 @@ export function StockRequestsPage() {
       setFeedback({ type: 'ok', text: `Permintaan ${req.requestNumber} dibatalkan.` });
     } catch (err) {
       setFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Gagal membatalkan.' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!deleteTarget) return;
+    setBusy(true);
+    setFeedback(null);
+    try {
+      await deleteStockRequest(deleteTarget);
+      setFeedback({ type: 'ok', text: `Permintaan ${deleteTarget.requestNumber} berhasil dihapus.` });
+      setDeleteTarget(null);
+    } catch (err) {
+      setFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Gagal menghapus permintaan.' });
+      setDeleteTarget(null);
     } finally {
       setBusy(false);
     }
@@ -305,6 +323,22 @@ export function StockRequestsPage() {
                               Batalkan
                             </button>
                           )}
+                        {canDeleteStockRequest(
+                          currentUser.role,
+                          req,
+                          currentUser.uid,
+                          deliveries.some((d) => d.requestId === req.id)
+                        ) && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            aria-label={`Hapus ${req.requestNumber}`}
+                            onClick={() => setDeleteTarget(req)}
+                            className="p-1.5 text-slate-500 hover:text-red-700 hover:bg-red-50 rounded"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        )}
                       </div>
                     </td>
                   </tr>
@@ -657,6 +691,49 @@ export function StockRequestsPage() {
                     ))}
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Confirmation Modal */}
+      {deleteTarget && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-xl w-full max-w-md p-6 space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <h2 className="font-display text-base font-bold text-slate-900">
+                Hapus Permintaan Barang
+              </h2>
+              <button
+                type="button"
+                aria-label="Tutup konfirmasi hapus"
+                onClick={() => setDeleteTarget(null)}
+              >
+                <X className="w-5 h-5 text-slate-500" />
+              </button>
+            </div>
+            <p className="text-sm text-slate-600">
+              Apakah Anda yakin ingin menghapus permanen permintaan{' '}
+              <span className="font-mono font-semibold text-slate-900">{deleteTarget.requestNumber}</span>{' '}
+              ({deleteTarget.requesterName})? Tindakan ini tidak dapat dibatalkan.
+            </p>
+            <div className="flex justify-end gap-3 pt-2">
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => setDeleteTarget(null)}
+                className="px-4 py-2 border border-slate-300 text-slate-700 text-sm font-medium rounded-lg hover:bg-slate-50"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => void handleConfirmDelete()}
+                className="px-4 py-2 bg-red-800 text-white text-sm font-medium rounded-lg hover:bg-red-900 disabled:opacity-60"
+              >
+                {busy ? 'Menghapus...' : 'Ya, Hapus'}
+              </button>
             </div>
           </div>
         </div>

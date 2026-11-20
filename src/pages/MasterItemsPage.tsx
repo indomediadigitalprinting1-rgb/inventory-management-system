@@ -14,7 +14,11 @@ import {
 import {
   canDeleteItemPermanently,
   canEditMasterItems,
+  canManageUnits,
   generateCode128Value,
+  generateNextSequentialCode,
+  partitionDeletableItems,
+  sortItemsByCode,
 } from '../domain/rules';
 import type { InventoryItem } from '../domain/types';
 import { useInventory } from '../services/inventoryContext';
@@ -22,7 +26,7 @@ import { exportBarcodeLabelsPdf, renderCode128ToSvg } from '../utils/barcode';
 import {
   exportItemsMasterExcel,
   exportTableToPdf,
-  parseItemsFromExcel,
+  parseMasterDatabaseFromExcel,
 } from '../utils/exports';
 import { StockHealthLabel } from '../components/StatusText';
 
@@ -47,9 +51,13 @@ export function MasterItemsPage() {
     categories,
     units,
     suppliers,
+    saveCategory,
+    saveUnit,
+    saveSupplier,
     saveItem,
     importItemsBatch,
     deleteItemPermanently,
+    deleteItemsBatch,
     systemConfig,
   } = useInventory();
 
@@ -58,9 +66,10 @@ export function MasterItemsPage() {
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'ACTIVE' | 'LOW' | 'OUT'>('ALL');
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
-  const [modalMode, setModalMode] = useState<'create' | 'edit' | 'detail' | 'barcode' | null>(null);
+  const [modalMode, setModalMode] = useState<'create' | 'edit' | 'detail' | 'barcode' | 'bulk-delete' | null>(null);
   const [selectedItem, setSelectedItem] = useState<InventoryItem | null>(null);
   const [bulkSelectedIds, setBulkSelectedIds] = useState<string[]>([]);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
   const [labelQtyMap, setLabelQtyMap] = useState<Record<string, number>>({});
   const [labelLayout, setLabelLayout] = useState<'A4_GRID' | 'THERMAL_50X30'>('A4_GRID');
 
@@ -78,34 +87,63 @@ export function MasterItemsPage() {
   const [active, setActive] = useState(true);
   const [saving, setSaving] = useState(false);
 
+  // Inline quick-add state for Category, Unit, Supplier inside item modal
+  const [quickAddType, setQuickAddType] = useState<'category' | 'unit' | 'supplier' | null>(null);
+  const [quickCode, setQuickCode] = useState('');
+  const [quickName, setQuickName] = useState('');
+  const [quickExtra, setQuickExtra] = useState('');
+  const [quickPhone, setQuickPhone] = useState('');
+  const [quickSaving, setQuickSaving] = useState(false);
+  const [quickError, setQuickError] = useState<string | null>(null);
+
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    const validIds = new Set(items.map((i) => i.id));
+    setBulkSelectedIds((prev) => {
+      const next = prev.filter((id) => validIds.has(id));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [items]);
 
   if (!currentUser) return null;
   const canEdit = canEditMasterItems(currentUser.role);
+  const canAddUnits = canManageUnits(currentUser.role);
+  const canBulkDelete = currentUser.role === 'OWNER';
   const showPrice = currentUser.role !== 'PRODUKSI';
+
+  const selectedBulkItems = sortItemsByCode(
+    items.filter((item) => bulkSelectedIds.includes(item.id))
+  );
+  const { deletable: deletableBulkItems, locked: lockedBulkItems } = partitionDeletableItems(
+    currentUser.role,
+    selectedBulkItems
+  );
 
   const filteredItems = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return items.filter((item) => {
-      if (categoryFilter !== 'ALL' && item.categoryId !== categoryFilter) return false;
-      if (statusFilter === 'ACTIVE' && !item.active) return false;
-      if (statusFilter === 'LOW' && !(item.currentStock > 0 && item.currentStock <= item.minStock)) return false;
-      if (statusFilter === 'OUT' && item.currentStock > 0) return false;
-      if (q) {
-        return (
-          item.code.toLowerCase().includes(q) ||
-          item.barcode.toLowerCase().includes(q) ||
-          item.name.toLowerCase().includes(q) ||
-          item.categoryName.toLowerCase().includes(q)
-        );
-      }
-      return true;
-    });
+    return sortItemsByCode(
+      items.filter((item) => {
+        if (categoryFilter !== 'ALL' && item.categoryId !== categoryFilter) return false;
+        if (statusFilter === 'ACTIVE' && !item.active) return false;
+        if (statusFilter === 'LOW' && !(item.currentStock > 0 && item.currentStock <= item.minStock)) return false;
+        if (statusFilter === 'OUT' && item.currentStock > 0) return false;
+        if (q) {
+          return (
+            item.code.toLowerCase().includes(q) ||
+            item.barcode.toLowerCase().includes(q) ||
+            item.name.toLowerCase().includes(q) ||
+            item.categoryName.toLowerCase().includes(q)
+          );
+        }
+        return true;
+      })
+    );
   }, [categoryFilter, items, search, statusFilter]);
 
   const openCreateModal = () => {
     setSelectedItem(null);
-    setCode(`BRG-${String(items.length + 1).padStart(3, '0')}`);
+    setCode(generateNextSequentialCode('BRG', items.map((i) => i.code), 3));
     setBarcode(generateCode128Value('IMS'));
     setName('');
     setCategoryId(categories[0]?.id ?? '');
@@ -117,6 +155,8 @@ export function MasterItemsPage() {
     setSupplierId(suppliers[0]?.id ?? '');
     setActive(true);
     setFeedback(null);
+    setQuickAddType(null);
+    setQuickError(null);
     setModalMode('create');
   };
 
@@ -134,7 +174,74 @@ export function MasterItemsPage() {
     setSupplierId(item.supplierId);
     setActive(item.active);
     setFeedback(null);
+    setQuickAddType(null);
+    setQuickError(null);
     setModalMode('edit');
+  };
+
+  const openQuickAdd = (type: 'category' | 'unit' | 'supplier') => {
+    if (quickAddType === type) {
+      setQuickAddType(null);
+      setQuickError(null);
+      return;
+    }
+    setQuickError(null);
+    setQuickName('');
+    setQuickExtra('');
+    setQuickPhone('');
+    if (type === 'category') {
+      setQuickCode(generateNextSequentialCode('KAT', categories.map((c) => c.code), 2));
+    } else if (type === 'unit') {
+      setQuickCode('');
+    } else {
+      setQuickCode(generateNextSequentialCode('SUP', suppliers.map((s) => s.code), 2));
+    }
+    setQuickAddType(type);
+  };
+
+  const handleSaveQuickAdd = async () => {
+    if (!quickAddType) return;
+    if (!quickCode.trim() || !quickName.trim()) {
+      setQuickError('Kode dan Nama wajib diisi.');
+      return;
+    }
+    setQuickSaving(true);
+    setQuickError(null);
+    try {
+      if (quickAddType === 'category') {
+        const created = await saveCategory({
+          code: quickCode.trim().toUpperCase(),
+          name: quickName.trim(),
+          description: quickExtra.trim(),
+          active: true,
+        });
+        setCategoryId(created.id);
+      } else if (quickAddType === 'unit') {
+        const created = await saveUnit({
+          code: quickCode.trim().toUpperCase(),
+          name: quickName.trim(),
+          description: quickExtra.trim(),
+          active: true,
+        });
+        setUnitId(created.id);
+      } else {
+        const created = await saveSupplier({
+          code: quickCode.trim().toUpperCase(),
+          name: quickName.trim(),
+          contactPerson: quickExtra.trim(),
+          phone: quickPhone.trim(),
+          email: '',
+          address: '',
+          active: true,
+        });
+        setSupplierId(created.id);
+      }
+      setQuickAddType(null);
+    } catch (err) {
+      setQuickError(err instanceof Error ? err.message : 'Gagal menambahkan data master.');
+    } finally {
+      setQuickSaving(false);
+    }
   };
 
   const openBarcodeModal = (singleItem?: InventoryItem) => {
@@ -185,9 +292,47 @@ export function MasterItemsPage() {
     setFeedback(null);
     try {
       await deleteItemPermanently(item);
+      setBulkSelectedIds((prev) => prev.filter((id) => id !== item.id));
       setFeedback({ type: 'ok', text: `Barang ${item.code} berhasil dihapus permanen.` });
     } catch (err) {
       setFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Gagal menghapus barang.' });
+    }
+  };
+
+  const handleConfirmBulkDelete = async () => {
+    if (selectedBulkItems.length === 0) {
+      setModalMode(null);
+      return;
+    }
+    setBulkDeleting(true);
+    setFeedback(null);
+    try {
+      const res = await deleteItemsBatch(selectedBulkItems);
+      setBulkSelectedIds([]);
+      setModalMode(null);
+      if (res.deletedCount > 0) {
+        const skipNote =
+          res.skipped.length > 0
+            ? ` ${res.skipped.length} barang dilewati karena memiliki riwayat transaksi.`
+            : '';
+        setFeedback({
+          type: 'ok',
+          text: `${res.deletedCount} barang terpilih berhasil dihapus permanen.${skipNote}`,
+        });
+      } else {
+        setFeedback({
+          type: 'err',
+          text: 'Tidak ada barang terpilih yang dapat dihapus karena semua memiliki riwayat transaksi.',
+        });
+      }
+    } catch (err) {
+      setModalMode(null);
+      setFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Gagal menghapus barang terpilih.',
+      });
+    } finally {
+      setBulkDeleting(false);
     }
   };
 
@@ -196,15 +341,48 @@ export function MasterItemsPage() {
     if (!file) return;
     setFeedback(null);
     try {
-      const rows = await parseItemsFromExcel(file);
-      if (rows.length === 0) {
-        setFeedback({ type: 'err', text: 'File Excel kosong atau kolom Kode/Nama Barang tidak ditemukan.' });
+      const parsed = await parseMasterDatabaseFromExcel(file);
+      const totalRows =
+        parsed.items.length +
+        parsed.categories.length +
+        parsed.units.length +
+        parsed.suppliers.length;
+      if (totalRows === 0) {
+        setFeedback({
+          type: 'err',
+          text: 'File Excel kosong atau format sheet/kolom Master Barang, Kategori, Satuan, dan Supplier tidak dikenali.',
+        });
         return;
       }
-      const res = await importItemsBatch(rows);
+      const res = await importItemsBatch(parsed);
+      const parts: string[] = [];
+      if (res.itemsCreated > 0) parts.push(`${res.itemsCreated} barang baru`);
+      if (res.itemsUpdated > 0) parts.push(`${res.itemsUpdated} barang diperbarui`);
+      if (res.categoriesCreated > 0) parts.push(`${res.categoriesCreated} kategori baru`);
+      if (res.categoriesUpdated > 0) parts.push(`${res.categoriesUpdated} kategori diperbarui`);
+      if (res.unitsCreated > 0) parts.push(`${res.unitsCreated} satuan baru`);
+      if (res.unitsUpdated > 0) parts.push(`${res.unitsUpdated} satuan diperbarui`);
+      if (res.suppliersCreated > 0) parts.push(`${res.suppliersCreated} supplier baru`);
+      if (res.suppliersUpdated > 0) parts.push(`${res.suppliersUpdated} supplier diperbarui`);
+
+      const totalChanges =
+        res.itemsCreated +
+        res.itemsUpdated +
+        res.categoriesCreated +
+        res.categoriesUpdated +
+        res.unitsCreated +
+        res.unitsUpdated +
+        res.suppliersCreated +
+        res.suppliersUpdated;
+
+      const summaryText =
+        parts.length > 0
+          ? `Sinkronisasi Excel selesai: ${parts.join(', ')}.`
+          : 'Data Excel sudah sinkron dengan database (tidak ada perubahan baru).';
+
       setFeedback({
-        type: res.imported > 0 ? 'ok' : 'err',
-        text: `Impor selesai: ${res.imported} barang berhasil ditambahkan${res.skipped.length ? `, ${res.skipped.length} dilewati (${res.skipped[0]})` : '.'}`,
+        type: totalChanges > 0 || res.skipped.length === 0 ? 'ok' : 'err',
+        text: `${summaryText}${res.skipped.length ? ` ${res.skipped.length} baris dilewati (${res.skipped[0]}).` : ''}`,
       });
     } catch (err) {
       setFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Gagal membaca file Excel.' });
@@ -312,15 +490,17 @@ export function MasterItemsPage() {
                   onClick={() => fileInputRef.current?.click()}
                   className="inline-flex items-center gap-1.5 px-3 py-2 border border-slate-300 text-slate-700 text-xs font-medium rounded-lg hover:bg-slate-50 whitespace-nowrap"
                 >
-                  <Upload className="w-3.5 h-3.5" />
+                  <Download className="w-3.5 h-3.5" />
                   Impor Excel
                 </button>
                 <button
                   type="button"
-                  onClick={() => exportItemsMasterExcel(filteredItems, showPrice)}
+                  onClick={() =>
+                    exportItemsMasterExcel(filteredItems, categories, units, suppliers, showPrice)
+                  }
                   className="inline-flex items-center gap-1.5 px-3 py-2 border border-slate-300 text-slate-700 text-xs font-medium rounded-lg hover:bg-slate-50 whitespace-nowrap"
                 >
-                  <Download className="w-3.5 h-3.5" />
+                  <Upload className="w-3.5 h-3.5" />
                   Export Excel
                 </button>
                 <button
@@ -331,6 +511,16 @@ export function MasterItemsPage() {
                   <Barcode className="w-3.5 h-3.5" />
                   Cetak Barcode ({bulkSelectedIds.length || 'Massal'})
                 </button>
+                {canBulkDelete && selectedBulkItems.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setModalMode('bulk-delete')}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 border border-red-300 bg-red-50 text-red-700 text-xs font-medium rounded-lg hover:bg-red-100 whitespace-nowrap"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    Hapus Terpilih ({selectedBulkItems.length})
+                  </button>
+                )}
               </>
             )}
             <button
@@ -374,10 +564,19 @@ export function MasterItemsPage() {
                       <input
                         type="checkbox"
                         aria-label="Pilih semua barang"
-                        checked={bulkSelectedIds.length > 0 && bulkSelectedIds.length === filteredItems.length}
-                        onChange={(e) =>
-                          setBulkSelectedIds(e.target.checked ? filteredItems.map((i) => i.id) : [])
+                        checked={
+                          filteredItems.length > 0 &&
+                          filteredItems.every((i) => bulkSelectedIds.includes(i.id))
                         }
+                        onChange={(e) => {
+                          const filteredIds = filteredItems.map((i) => i.id);
+                          if (e.target.checked) {
+                            setBulkSelectedIds((prev) => Array.from(new Set([...prev, ...filteredIds])));
+                          } else {
+                            const filteredSet = new Set(filteredIds);
+                            setBulkSelectedIds((prev) => prev.filter((id) => !filteredSet.has(id)));
+                          }
+                        }}
                       />
                     </th>
                   )}
@@ -485,7 +684,7 @@ export function MasterItemsPage() {
       {/* Create / Edit Modal */}
       {(modalMode === 'create' || modalMode === 'edit') && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4 overflow-y-auto">
-          <div className="bg-white border border-slate-200 rounded-xl w-full max-w-2xl p-6 space-y-5 my-8">
+          <div className="bg-white border border-slate-200 rounded-xl w-full max-w-2xl p-6 space-y-5 my-auto max-h-[92vh] overflow-y-auto">
             <div className="flex items-center justify-between border-b border-slate-200 pb-3">
               <h2 className="font-display text-lg font-bold text-slate-900">
                 {modalMode === 'create' ? 'Tambah Master Barang Baru' : `Edit Barang: ${selectedItem?.code}`}
@@ -558,9 +757,19 @@ export function MasterItemsPage() {
                   />
                 </div>
                 <div>
-                  <label htmlFor="item-cat" className="block text-xs font-medium text-slate-700 mb-1">
-                    Kategori
-                  </label>
+                  <div className="flex items-center justify-between mb-1">
+                    <label htmlFor="item-cat" className="block text-xs font-medium text-slate-700">
+                      Kategori
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => openQuickAdd('category')}
+                      className="inline-flex items-center gap-1 text-[11px] font-medium text-red-800 hover:underline"
+                    >
+                      <Plus className="w-3 h-3" />
+                      {quickAddType === 'category' ? 'Tutup' : 'Tambah Kategori'}
+                    </button>
+                  </div>
                   <select
                     id="item-cat"
                     required
@@ -578,6 +787,77 @@ export function MasterItemsPage() {
                 </div>
               </div>
 
+              {quickAddType === 'category' && (
+                <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-slate-800">Tambah Kategori Baru</span>
+                    <button
+                      type="button"
+                      onClick={() => setQuickAddType(null)}
+                      className="text-xs text-slate-500 hover:text-slate-800"
+                    >
+                      Batal
+                    </button>
+                  </div>
+                  {quickError && (
+                    <div className="p-2 bg-red-50 border border-red-200 rounded text-xs text-red-800">
+                      {quickError}
+                    </div>
+                  )}
+                  <div className="grid sm:grid-cols-3 gap-2.5">
+                    <div>
+                      <label htmlFor="quick-cat-code" className="block text-[11px] font-medium text-slate-600 mb-1">
+                        Kode Kategori
+                      </label>
+                      <input
+                        id="quick-cat-code"
+                        maxLength={32}
+                        value={quickCode}
+                        onChange={(e) => setQuickCode(e.target.value)}
+                        placeholder="KAT-01"
+                        className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-white font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="quick-cat-name" className="block text-[11px] font-medium text-slate-600 mb-1">
+                        Nama Kategori
+                      </label>
+                      <input
+                        id="quick-cat-name"
+                        maxLength={100}
+                        value={quickName}
+                        onChange={(e) => setQuickName(e.target.value)}
+                        placeholder="Contoh: Bahan Baku"
+                        className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="quick-cat-desc" className="block text-[11px] font-medium text-slate-600 mb-1">
+                        Deskripsi (Opsional)
+                      </label>
+                      <input
+                        id="quick-cat-desc"
+                        maxLength={300}
+                        value={quickExtra}
+                        onChange={(e) => setQuickExtra(e.target.value)}
+                        placeholder="Keterangan singkat"
+                        className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
+                      />
+                    </div>
+                  </div>
+                  <div className="flex justify-end">
+                    <button
+                      type="button"
+                      disabled={quickSaving}
+                      onClick={() => void handleSaveQuickAdd()}
+                      className="px-3 py-1.5 bg-slate-900 text-white text-xs font-medium rounded-md hover:bg-slate-800 disabled:opacity-60"
+                    >
+                      {quickSaving ? 'Menyimpan...' : 'Simpan & Pilih Kategori'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
               <div>
                 <label htmlFor="item-spec" className="block text-xs font-medium text-slate-700 mb-1">
                   Spesifikasi
@@ -592,9 +872,21 @@ export function MasterItemsPage() {
 
               <div className="grid sm:grid-cols-4 gap-4">
                 <div>
-                  <label htmlFor="item-unit" className="block text-xs font-medium text-slate-700 mb-1">
-                    Satuan
-                  </label>
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <label htmlFor="item-unit" className="block text-xs font-medium text-slate-700">
+                      Satuan
+                    </label>
+                    {canAddUnits && (
+                      <button
+                        type="button"
+                        onClick={() => openQuickAdd('unit')}
+                        className="inline-flex items-center gap-0.5 text-[11px] font-medium text-red-800 hover:underline whitespace-nowrap"
+                      >
+                        <Plus className="w-3 h-3" />
+                        {quickAddType === 'unit' ? 'Tutup' : 'Tambah'}
+                      </button>
+                    )}
+                  </div>
                   <select
                     id="item-unit"
                     required
@@ -654,11 +946,92 @@ export function MasterItemsPage() {
                 </div>
               </div>
 
+              {quickAddType === 'unit' && canAddUnits && (
+                <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-slate-800">Tambah Satuan Baru</span>
+                    <button
+                      type="button"
+                      onClick={() => setQuickAddType(null)}
+                      className="text-xs text-slate-500 hover:text-slate-800"
+                    >
+                      Batal
+                    </button>
+                  </div>
+                  {quickError && (
+                    <div className="p-2 bg-red-50 border border-red-200 rounded text-xs text-red-800">
+                      {quickError}
+                    </div>
+                  )}
+                  <div className="grid sm:grid-cols-3 gap-2.5">
+                    <div>
+                      <label htmlFor="quick-unit-code" className="block text-[11px] font-medium text-slate-600 mb-1">
+                        Kode Satuan
+                      </label>
+                      <input
+                        id="quick-unit-code"
+                        maxLength={24}
+                        value={quickCode}
+                        onChange={(e) => setQuickCode(e.target.value)}
+                        placeholder="PCS / BOX / KG"
+                        className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-white font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="quick-unit-name" className="block text-[11px] font-medium text-slate-600 mb-1">
+                        Nama Satuan
+                      </label>
+                      <input
+                        id="quick-unit-name"
+                        maxLength={80}
+                        value={quickName}
+                        onChange={(e) => setQuickName(e.target.value)}
+                        placeholder="Contoh: Pcs"
+                        className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="quick-unit-desc" className="block text-[11px] font-medium text-slate-600 mb-1">
+                        Deskripsi (Opsional)
+                      </label>
+                      <input
+                        id="quick-unit-desc"
+                        maxLength={300}
+                        value={quickExtra}
+                        onChange={(e) => setQuickExtra(e.target.value)}
+                        placeholder="Keterangan singkat"
+                        className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
+                      />
+                    </div>
+                  </div>
+                  <div className="flex justify-end">
+                    <button
+                      type="button"
+                      disabled={quickSaving}
+                      onClick={() => void handleSaveQuickAdd()}
+                      className="px-3 py-1.5 bg-slate-900 text-white text-xs font-medium rounded-md hover:bg-slate-800 disabled:opacity-60"
+                    >
+                      {quickSaving ? 'Menyimpan...' : 'Simpan & Pilih Satuan'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
               <div className="grid sm:grid-cols-2 gap-4 items-end">
                 <div>
-                  <label htmlFor="item-supplier" className="block text-xs font-medium text-slate-700 mb-1">
-                    Supplier Utama
-                  </label>
+                  <div className="flex items-center justify-between mb-1">
+                    <label htmlFor="item-supplier" className="block text-xs font-medium text-slate-700">
+                      Supplier Utama
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => openQuickAdd('supplier')}
+                      className="inline-flex items-center gap-1 text-[11px] font-medium text-red-800 hover:underline"
+                    >
+                      <Plus className="w-3 h-3" />
+                      {quickAddType === 'supplier' ? 'Tutup' : 'Tambah Supplier'}
+                    </button>
+                  </div>
                   <select
                     id="item-supplier"
                     required
@@ -683,6 +1056,90 @@ export function MasterItemsPage() {
                   Status Barang Aktif
                 </label>
               </div>
+
+              {quickAddType === 'supplier' && (
+                <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-slate-800">Tambah Supplier Baru</span>
+                    <button
+                      type="button"
+                      onClick={() => setQuickAddType(null)}
+                      className="text-xs text-slate-500 hover:text-slate-800"
+                    >
+                      Batal
+                    </button>
+                  </div>
+                  {quickError && (
+                    <div className="p-2 bg-red-50 border border-red-200 rounded text-xs text-red-800">
+                      {quickError}
+                    </div>
+                  )}
+                  <div className="grid sm:grid-cols-2 gap-2.5">
+                    <div>
+                      <label htmlFor="quick-sup-code" className="block text-[11px] font-medium text-slate-600 mb-1">
+                        Kode Supplier
+                      </label>
+                      <input
+                        id="quick-sup-code"
+                        maxLength={32}
+                        value={quickCode}
+                        onChange={(e) => setQuickCode(e.target.value)}
+                        placeholder="SUP-01"
+                        className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-white font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="quick-sup-name" className="block text-[11px] font-medium text-slate-600 mb-1">
+                        Nama Supplier
+                      </label>
+                      <input
+                        id="quick-sup-name"
+                        maxLength={140}
+                        value={quickName}
+                        onChange={(e) => setQuickName(e.target.value)}
+                        placeholder="Contoh: PT Maju Jaya"
+                        className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="quick-sup-pic" className="block text-[11px] font-medium text-slate-600 mb-1">
+                        Kontak PIC (Opsional)
+                      </label>
+                      <input
+                        id="quick-sup-pic"
+                        maxLength={100}
+                        value={quickExtra}
+                        onChange={(e) => setQuickExtra(e.target.value)}
+                        placeholder="Nama kontak"
+                        className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="quick-sup-phone" className="block text-[11px] font-medium text-slate-600 mb-1">
+                        No. Telepon (Opsional)
+                      </label>
+                      <input
+                        id="quick-sup-phone"
+                        maxLength={40}
+                        value={quickPhone}
+                        onChange={(e) => setQuickPhone(e.target.value)}
+                        placeholder="08xx / 021-xxx"
+                        className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
+                      />
+                    </div>
+                  </div>
+                  <div className="flex justify-end">
+                    <button
+                      type="button"
+                      disabled={quickSaving}
+                      onClick={() => void handleSaveQuickAdd()}
+                      className="px-3 py-1.5 bg-slate-900 text-white text-xs font-medium rounded-md hover:bg-slate-800 disabled:opacity-60"
+                    >
+                      {quickSaving ? 'Menyimpan...' : 'Simpan & Pilih Supplier'}
+                    </button>
+                  </div>
+                </div>
+              )}
 
               <div className="pt-3 border-t border-slate-200 flex justify-end gap-3">
                 <button
@@ -867,6 +1324,84 @@ export function MasterItemsPage() {
               >
                 <Printer className="w-4 h-4" />
                 Unduh PDF Label Barcode
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk Delete Confirmation Modal */}
+      {modalMode === 'bulk-delete' && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-xl w-full max-w-lg p-6 space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <h2 className="font-display text-lg font-bold text-slate-900">
+                Konfirmasi Hapus Barang Terpilih
+              </h2>
+              <button type="button" aria-label="Tutup konfirmasi hapus" onClick={() => setModalMode(null)}>
+                <X className="w-5 h-5 text-slate-500" />
+              </button>
+            </div>
+
+            {deletableBulkItems.length > 0 ? (
+              <p className="text-sm text-slate-700">
+                Sebanyak <span className="font-semibold text-red-700">{deletableBulkItems.length} barang</span>{' '}
+                berikut belum memiliki riwayat transaksi dan akan dihapus permanen dari master database:
+              </p>
+            ) : (
+              <p className="text-sm text-red-700">
+                Semua barang yang Anda seleksi memiliki riwayat transaksi sehingga tidak dapat dihapus permanen.
+              </p>
+            )}
+
+            {deletableBulkItems.length > 0 && (
+              <div className="max-h-44 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
+                {deletableBulkItems.map((item) => (
+                  <div key={item.id} className="px-3 py-2 flex items-center justify-between gap-3 text-xs">
+                    <div className="min-w-0">
+                      <span className="font-mono font-semibold text-slate-900 mr-2">{item.code}</span>
+                      <span className="text-slate-700 truncate">{item.name}</span>
+                    </div>
+                    <span className="text-red-700 font-medium shrink-0">Akan dihapus</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {lockedBulkItems.length > 0 && (
+              <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg space-y-1.5">
+                <p className="text-xs font-semibold text-amber-900">
+                  {lockedBulkItems.length} barang dilewati (memiliki riwayat transaksi):
+                </p>
+                <ul className="text-xs text-amber-800 space-y-0.5 max-h-24 overflow-y-auto">
+                  {lockedBulkItems.map((item) => (
+                    <li key={item.id}>
+                      <span className="font-mono font-semibold">{item.code}</span> — {item.name}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                disabled={bulkDeleting}
+                onClick={() => setModalMode(null)}
+                className="px-4 py-2 border border-slate-300 text-slate-700 text-sm font-medium rounded-lg hover:bg-slate-50"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                disabled={bulkDeleting || deletableBulkItems.length === 0}
+                onClick={() => void handleConfirmBulkDelete()}
+                className="inline-flex items-center gap-1.5 px-4 py-2 bg-red-700 text-white text-sm font-medium rounded-lg hover:bg-red-800 disabled:opacity-50"
+              >
+                <Trash2 className="w-4 h-4" />
+                {bulkDeleting
+                  ? 'Menghapus...'
+                  : `Hapus Permanen (${deletableBulkItems.length} Barang)`}
               </button>
             </div>
           </div>

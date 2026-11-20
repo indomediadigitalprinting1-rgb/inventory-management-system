@@ -1,16 +1,20 @@
 import type {
   AdjustmentType,
   AdminSlot,
+  Category,
   DeliveryLineItem,
   DeliveryRecord,
   IncomingLineItem,
   IncomingTransaction,
   InventoryItem,
   NavRoute,
+  NotificationItem,
   RequestLineItem,
   StockAdjustment,
   StockLedgerEntry,
   StockRequest,
+  Supplier,
+  Unit,
   UserAccount,
   UserInvite,
   UserRole,
@@ -96,6 +100,187 @@ export function canDeleteItemPermanently(role: UserRole, item: Pick<InventoryIte
   return !item.hasTransactions;
 }
 
+export function partitionDeletableItems<
+  T extends Pick<InventoryItem, 'id' | 'code' | 'name' | 'hasTransactions'>
+>(role: UserRole, items: T[]): { deletable: T[]; locked: T[] } {
+  const deletable: T[] = [];
+  const locked: T[] = [];
+  for (const item of items) {
+    if (canDeleteItemPermanently(role, item)) {
+      deletable.push(item);
+    } else {
+      locked.push(item);
+    }
+  }
+  return { deletable, locked };
+}
+
+export function canDeleteCategory(
+  role: UserRole,
+  categoryId: string,
+  items: ReadonlyArray<Pick<InventoryItem, 'categoryId'>>
+): boolean {
+  if (role !== 'OWNER') return false;
+  return !items.some((item) => item.categoryId === categoryId);
+}
+
+export function partitionDeletableCategories<
+  T extends Pick<Category, 'id' | 'code' | 'name'>,
+>(
+  role: UserRole,
+  categories: readonly T[],
+  items: ReadonlyArray<Pick<InventoryItem, 'categoryId'>>
+): { deletable: T[]; locked: T[] } {
+  const deletable: T[] = [];
+  const locked: T[] = [];
+  for (const category of categories) {
+    if (canDeleteCategory(role, category.id, items)) {
+      deletable.push(category);
+    } else {
+      locked.push(category);
+    }
+  }
+  return { deletable, locked };
+}
+
+export function canDeleteUnit(
+  role: UserRole,
+  unitId: string,
+  items: ReadonlyArray<Pick<InventoryItem, 'unitId'>>
+): boolean {
+  if (role !== 'OWNER') return false;
+  return !items.some((item) => item.unitId === unitId);
+}
+
+export function partitionDeletableUnits<
+  T extends Pick<Unit, 'id' | 'code' | 'name'>,
+>(
+  role: UserRole,
+  units: readonly T[],
+  items: ReadonlyArray<Pick<InventoryItem, 'unitId'>>
+): { deletable: T[]; locked: T[] } {
+  const deletable: T[] = [];
+  const locked: T[] = [];
+  for (const unit of units) {
+    if (canDeleteUnit(role, unit.id, items)) {
+      deletable.push(unit);
+    } else {
+      locked.push(unit);
+    }
+  }
+  return { deletable, locked };
+}
+
+export function canDeleteSupplier(
+  role: UserRole,
+  supplierId: string,
+  items: ReadonlyArray<Pick<InventoryItem, 'supplierId'>>,
+  incomingTransactions: ReadonlyArray<Pick<IncomingTransaction, 'supplierId'>> = []
+): boolean {
+  if (role !== 'OWNER') return false;
+  if (items.some((item) => item.supplierId === supplierId)) return false;
+  if (incomingTransactions.some((tx) => tx.supplierId === supplierId)) return false;
+  return true;
+}
+
+export function partitionDeletableSuppliers<
+  T extends Pick<Supplier, 'id' | 'code' | 'name'>,
+>(
+  role: UserRole,
+  suppliers: readonly T[],
+  items: ReadonlyArray<Pick<InventoryItem, 'supplierId'>>,
+  incomingTransactions: ReadonlyArray<Pick<IncomingTransaction, 'supplierId'>> = []
+): { deletable: T[]; locked: T[] } {
+  const deletable: T[] = [];
+  const locked: T[] = [];
+  for (const supplier of suppliers) {
+    if (canDeleteSupplier(role, supplier.id, items, incomingTransactions)) {
+      deletable.push(supplier);
+    } else {
+      locked.push(supplier);
+    }
+  }
+  return { deletable, locked };
+}
+
+export function canDeleteStockRequest(
+  role: UserRole,
+  request: Pick<StockRequest, 'status' | 'requesterUid' | 'items'>,
+  currentUid: string,
+  hasDeliveries: boolean
+): boolean {
+  if (hasDeliveries) return false;
+  if (request.items.some((l) => l.deliveredQty > 0)) return false;
+  if (request.status === 'DALAM_PROSES_PENGAMBILAN' || request.status === 'SELESAI') return false;
+  if (role === 'OWNER') return true;
+  if (role === 'ADMIN') {
+    return request.status === 'MENUNGGU_PERSETUJUAN' || request.status === 'DITOLAK' || request.status === 'DIBATALKAN';
+  }
+  return (
+    request.requesterUid === currentUid &&
+    (request.status === 'MENUNGGU_PERSETUJUAN' || request.status === 'DIBATALKAN')
+  );
+}
+
+export const READ_NOTIFICATION_TTL_MS = 30 * 60 * 1000;
+
+export function canDeleteNotification(
+  role: UserRole,
+  notif: Pick<NotificationItem, 'targetRole' | 'targetUid'>,
+  currentUid: string
+): boolean {
+  if (role === 'OWNER') return true;
+  if (role === 'ADMIN') return notif.targetRole === 'ADMIN' || notif.targetUid === currentUid;
+  return notif.targetUid === currentUid;
+}
+
+export function getNotificationReadAt(
+  notif: Pick<NotificationItem, 'readBy' | 'readAtBy' | 'createdAt'>,
+  uid: string
+): string | null {
+  if (!notif.readBy.includes(uid)) return null;
+  return notif.readAtBy?.[uid] ?? notif.createdAt ?? null;
+}
+
+export function isNotificationExpired(
+  notif: Pick<NotificationItem, 'readBy' | 'readAtBy' | 'createdAt'>,
+  uid: string,
+  nowMs = Date.now(),
+  ttlMs = READ_NOTIFICATION_TTL_MS
+): boolean {
+  const readAtIso = getNotificationReadAt(notif, uid);
+  if (!readAtIso) return false;
+  const readAtMs = Date.parse(readAtIso);
+  if (!Number.isFinite(readAtMs)) return false;
+  return nowMs - readAtMs >= ttlMs;
+}
+
+export function filterVisibleNotifications<
+  T extends Pick<NotificationItem, 'readBy' | 'readAtBy' | 'createdAt'>,
+>(
+  notifications: T[],
+  uid: string,
+  nowMs = Date.now(),
+  ttlMs = READ_NOTIFICATION_TTL_MS
+): T[] {
+  return notifications.filter((n) => !isNotificationExpired(n, uid, nowMs, ttlMs));
+}
+
+export function getRemainingReadMinutes(
+  notif: Pick<NotificationItem, 'readBy' | 'readAtBy' | 'createdAt'>,
+  uid: string,
+  nowMs = Date.now(),
+  ttlMs = READ_NOTIFICATION_TTL_MS
+): number | null {
+  const readAtIso = getNotificationReadAt(notif, uid);
+  if (!readAtIso) return null;
+  const readAtMs = Date.parse(readAtIso);
+  if (!Number.isFinite(readAtMs)) return null;
+  const remainingMs = readAtMs + ttlMs - nowMs;
+  if (remainingMs <= 0) return 0;
+  return Math.max(1, Math.ceil(remainingMs / 60000));
+}
+
 export function sanitizeId(raw: string): string {
   const cleaned = raw.trim().replace(/[^a-zA-Z0-9_-]/g, '_');
   return cleaned.slice(0, 120) || 'id';
@@ -115,6 +300,47 @@ export function generateCode128Value(prefix = 'IMS'): string {
   return `${prefix}-${ts}${rand}`;
 }
 
+export function generateNextSequentialCode(
+  prefix: string,
+  existingCodes: string[],
+  padLength = 3
+): string {
+  const normPrefix = prefix.trim().toUpperCase();
+  const escapedPrefix = normPrefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp(`^${escapedPrefix}-(\\d+)$`, 'i');
+  const taken = new Set<string>();
+  let maxNumber = 0;
+
+  for (const raw of existingCodes) {
+    const clean = raw.trim().toUpperCase();
+    if (!clean) continue;
+    taken.add(clean);
+    const match = clean.match(pattern);
+    if (match) {
+      const num = parseInt(match[1], 10);
+      if (Number.isFinite(num) && num > maxNumber) {
+        maxNumber = num;
+      }
+    }
+  }
+
+  let next = maxNumber + 1;
+  while (next < 1_000_000) {
+    const candidate = `${normPrefix}-${String(next).padStart(padLength, '0')}`;
+    if (!taken.has(candidate)) {
+      return candidate;
+    }
+    next++;
+  }
+  return `${normPrefix}-${Date.now().toString().slice(-4)}`;
+}
+
+export function sortItemsByCode<T extends { code: string }>(items: readonly T[]): T[] {
+  return [...items].sort((a, b) =>
+    a.code.trim().localeCompare(b.code.trim(), 'id', { numeric: true, sensitivity: 'base' })
+  );
+}
+
 export function generateDocNumber(prefix: string, sequenceSeed?: string): string {
   const d = new Date();
   const ymd = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
@@ -122,9 +348,14 @@ export function generateDocNumber(prefix: string, sequenceSeed?: string): string
   return `${prefix}-${ymd}-${suffix}`;
 }
 
+export function getNonOwnerUsers<T extends Pick<UserAccount, 'role'>>(users: readonly T[]): T[] {
+  return users.filter((u) => u.role !== 'OWNER');
+}
+
 export function validateAdminSlotAvailability(params: {
   targetRole: UserRole;
   targetEmail: string;
+  excludeUid?: string;
   adminSlot: AdminSlot | null;
   existingUsers: UserAccount[];
   existingInvites: UserInvite[];
@@ -136,8 +367,10 @@ export function validateAdminSlotAvailability(params: {
 
   if (
     params.adminSlot?.occupied &&
-    params.adminSlot.adminEmail &&
-    params.adminSlot.adminEmail.trim().toLowerCase() !== normalizedTarget
+    ((params.excludeUid && params.adminSlot.adminUid && params.adminSlot.adminUid !== params.excludeUid) ||
+      (!params.excludeUid &&
+        params.adminSlot.adminEmail &&
+        params.adminSlot.adminEmail.trim().toLowerCase() !== normalizedTarget))
   ) {
     return {
       allowed: false,
@@ -146,12 +379,16 @@ export function validateAdminSlotAvailability(params: {
   }
 
   const otherActiveAdminUser = params.existingUsers.find(
-    (u) => u.role === 'ADMIN' && u.active && u.email.trim().toLowerCase() !== normalizedTarget
+    (u) =>
+      u.role === 'ADMIN' &&
+      u.active &&
+      (params.excludeUid ? u.uid !== params.excludeUid : true) &&
+      u.email.trim().toLowerCase() !== normalizedTarget
   );
   if (otherActiveAdminUser) {
     return {
       allowed: false,
-      reason: `Akun ADMIN aktif sudah ada (${otherActiveAdminUser.email}). Nonaktifkan atau ubah role Admin yang ada terlebih dahulu.`,
+      reason: `Akun ADMIN aktif sudah ada (${otherActiveAdminUser.email}). Hapus atau nonaktifkan Admin yang ada terlebih dahulu.`,
     };
   }
 

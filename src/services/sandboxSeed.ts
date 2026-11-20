@@ -40,51 +40,44 @@ export function createSandboxSeedData(activeRole: UserRole): {
   state: InventorySnapshotState;
 } {
   const now = '2026-11-18T08:00:00.000Z';
-  const users: UserAccount[] = [
-    {
-      uid: 'uid_owner_01',
-      email: 'owner@pabriknusantara.id',
-      name: 'Hendra Wijaya',
-      role: 'OWNER',
-      department: 'Direksi',
-      active: true,
-      createdAt: '2026-11-01T08:00:00.000Z',
-      updatedAt: now,
-    },
-    {
-      uid: 'uid_admin_01',
-      email: 'admin.gudang@pabriknusantara.id',
-      name: 'Rina Kusuma',
-      role: 'ADMIN',
-      department: 'Gudang & Logistik',
-      active: true,
-      createdAt: '2026-11-02T08:00:00.000Z',
-      updatedAt: now,
-    },
-    {
-      uid: 'uid_prod_01',
-      email: 'produksi.a@pabriknusantara.id',
-      name: 'Budi Santoso',
-      role: 'PRODUKSI',
-      department: 'Produksi Line A',
-      active: true,
-      createdAt: '2026-11-03T08:00:00.000Z',
-      updatedAt: now,
-    },
-    {
-      uid: 'uid_prod_02',
-      email: 'produksi.b@pabriknusantara.id',
-      name: 'Dewi Lestari',
-      role: 'PRODUKSI',
-      department: 'Produksi Line B',
-      active: true,
-      createdAt: '2026-11-03T09:00:00.000Z',
-      updatedAt: now,
-    },
-  ];
+  const ownerUser: UserAccount = {
+    uid: 'uid_owner_01',
+    email: 'owner@pabriknusantara.id',
+    name: 'Hendra Wijaya',
+    role: 'OWNER',
+    department: 'Direksi',
+    active: true,
+    createdAt: '2026-11-01T08:00:00.000Z',
+    updatedAt: now,
+  };
 
-  const currentUser =
-    users.find((u) => u.role === activeRole) ?? users[0];
+  const sandboxRoleOverrideUser: UserAccount | null =
+    activeRole === 'ADMIN'
+      ? {
+          uid: 'uid_admin_01',
+          email: 'admin.gudang@pabriknusantara.id',
+          name: 'Rina Kusuma',
+          role: 'ADMIN',
+          department: 'Gudang & Logistik',
+          active: true,
+          createdAt: '2026-11-02T08:00:00.000Z',
+          updatedAt: now,
+        }
+      : activeRole === 'PRODUKSI'
+      ? {
+          uid: 'uid_prod_01',
+          email: 'produksi.a@pabriknusantara.id',
+          name: 'Budi Santoso',
+          role: 'PRODUKSI',
+          department: 'Produksi Line A',
+          active: true,
+          createdAt: '2026-11-03T08:00:00.000Z',
+          updatedAt: now,
+        }
+      : null;
+
+  const users: UserAccount[] = sandboxRoleOverrideUser ? [ownerUser, sandboxRoleOverrideUser] : [ownerUser];
+  const currentUser = sandboxRoleOverrideUser ?? ownerUser;
 
   const categories: Category[] = [
     { id: 'cat_1', code: 'KAT-LGM', name: 'Bahan Baku Logam', description: 'Plat besi, pipa stainless, dan profil aluminium', active: true, createdAt: now, updatedAt: now },
@@ -470,12 +463,20 @@ export function createSandboxSeedData(activeRole: UserRole): {
         lowStockAlertEnabled: true,
         updatedAt: now,
       },
-      adminSlot: {
-        occupied: true,
-        adminUid: 'uid_admin_01',
-        adminEmail: 'admin.gudang@pabriknusantara.id',
-        updatedAt: now,
-      },
+      adminSlot:
+        activeRole === 'ADMIN' && sandboxRoleOverrideUser
+          ? {
+              occupied: true,
+              adminUid: sandboxRoleOverrideUser.uid,
+              adminEmail: sandboxRoleOverrideUser.email,
+              updatedAt: now,
+            }
+          : {
+              occupied: false,
+              adminUid: null,
+              adminEmail: null,
+              updatedAt: now,
+            },
       users,
       invites: [],
       categories,

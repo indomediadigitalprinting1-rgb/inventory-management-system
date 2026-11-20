@@ -259,6 +259,7 @@ export interface NotificationItem {
   linkView?: NavRoute | null;
   relatedId?: string | null;
   readBy: string[];
+  readAtBy?: Record<string, string>;
   createdAt: string;
 }
 

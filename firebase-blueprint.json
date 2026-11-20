@@ -311,6 +311,7 @@
         "linkView": { "type": "string", "maxLength": 64 },
         "relatedId": { "type": "string", "maxLength": 128 },
         "readBy": { "type": "array" },
+        "readAtBy": { "type": "object", "description": "Per-user read timestamp map." },
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "targetRole", "type", "title", "message", "readBy", "createdAt"]

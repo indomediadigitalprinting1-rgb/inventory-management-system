@@ -1,5 +1,15 @@
 import React, { useMemo, useState } from 'react';
-import { Download, Plus, ShieldCheck, SlidersHorizontal, UserPlus, X } from 'lucide-react';
+import {
+  AlertTriangle,
+  Download,
+  Plus,
+  ShieldCheck,
+  SlidersHorizontal,
+  Trash2,
+  UserPlus,
+  X,
+} from 'lucide-react';
+import { getNonOwnerUsers } from '../domain/rules';
 import type { AdjustmentType, UserAccount, UserRole } from '../domain/types';
 import { useInventory } from '../services/inventoryContext';
 
@@ -10,6 +20,9 @@ export function UsersPage() {
     adminSlot,
     saveUserInvite,
     updateUserAccountRoleOrStatus,
+    deleteUserAccount,
+    deleteUserInvite,
+    deleteAllNonOwnerUsers,
   } = useInventory();
 
   const [showInviteModal, setShowInviteModal] = useState(false);
@@ -19,21 +32,33 @@ export function UsersPage() {
   const [department, setDepartment] = useState('Produksi');
   const [active, setActive] = useState(true);
   const [editingUser, setEditingUser] = useState<UserAccount | null>(null);
+  const [deletingUser, setDeletingUser] = useState<UserAccount | null>(null);
+  const [confirmCleanupOpen, setConfirmCleanupOpen] = useState(false);
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [modalError, setModalError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const handleSaveInvite = async (e: React.FormEvent) => {
+  const nonOwnerUsers = useMemo(() => getNonOwnerUsers(users), [users]);
+  const hasCleanupTargets =
+    nonOwnerUsers.length > 0 || invites.length > 0 || Boolean(adminSlot?.occupied);
+
+  const handleCreateInvite = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true);
+    setModalError(null);
     setFeedback(null);
     try {
       await saveUserInvite({ name, email, role, department, active });
+      const savedEmail = email.trim().toLowerCase();
       setShowInviteModal(false);
       setName('');
       setEmail('');
-      setFeedback({ type: 'ok', text: `Otorisasi akun ${email} (${role}) berhasil disimpan.` });
+      setFeedback({
+        type: 'ok',
+        text: `Otorisasi akun untuk ${savedEmail} (${role}) berhasil disimpan. Pengguna dapat langsung login dengan Google menggunakan email tersebut.`,
+      });
     } catch (err) {
-      setFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Gagal menyimpan pengguna.' });
+      setModalError(err instanceof Error ? err.message : 'Gagal menyimpan otorisasi.');
     } finally {
       setBusy(false);
     }
@@ -43,6 +68,7 @@ export function UsersPage() {
     e.preventDefault();
     if (!editingUser) return;
     setBusy(true);
+    setModalError(null);
     setFeedback(null);
     try {
       await updateUserAccountRoleOrStatus(editingUser, {
@@ -51,10 +77,49 @@ export function UsersPage() {
         department,
         active,
       });
+      const label = editingUser.email;
       setEditingUser(null);
-      setFeedback({ type: 'ok', text: `Akun ${editingUser.email} berhasil diperbarui.` });
+      setFeedback({ type: 'ok', text: `Akun ${label} berhasil diperbarui.` });
     } catch (err) {
-      setFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Gagal memperbarui akun.' });
+      setModalError(err instanceof Error ? err.message : 'Gagal memperbarui akun.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleConfirmDeleteUser = async () => {
+    if (!deletingUser) return;
+    setBusy(true);
+    setFeedback(null);
+    try {
+      const label = deletingUser.email;
+      await deleteUserAccount(deletingUser);
+      setDeletingUser(null);
+      setFeedback({ type: 'ok', text: `Akun ${label} berhasil dihapus dari daftar pengguna.` });
+    } catch (err) {
+      setFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Gagal menghapus akun.' });
+      setDeletingUser(null);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleConfirmCleanupNonOwners = async () => {
+    setBusy(true);
+    setFeedback(null);
+    try {
+      const res = await deleteAllNonOwnerUsers();
+      setConfirmCleanupOpen(false);
+      setFeedback({
+        type: 'ok',
+        text: `Pembersihan selesai: ${res.deletedUsers} pengguna lain dan ${res.deletedInvites} undangan dihapus. Kini hanya akun Owner yang tersisa.`,
+      });
+    } catch (err) {
+      setFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Gagal membersihkan data pengguna.',
+      });
+      setConfirmCleanupOpen(false);
     } finally {
       setBusy(false);
     }
@@ -81,38 +146,59 @@ export function UsersPage() {
         <div className="space-y-1">
           <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
             <ShieldCheck className="w-4 h-4 text-blue-700" />
-            <span>Kebijakan Multi-User Terkunci di Database</span>
+            <span>Otorisasi &amp; Kebijakan Slot Admin</span>
           </div>
           <p className="text-xs text-slate-600">
             Slot Admin Gudang (Maksimal 1):{' '}
             <span className="font-semibold text-slate-900">
               {adminSlot?.occupied ? `Terisi (${adminSlot.adminEmail})` : 'Tersedia (0/1)'}
-            </span>{' '}
-            · Akun Produksi dapat dibuat lebih dari satu.
+            </span>
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => {
-            setName('');
-            setEmail('');
-            setRole('PRODUKSI');
-            setDepartment('Produksi');
-            setActive(true);
-            setFeedback(null);
-            setShowInviteModal(true);
-          }}
-          className="inline-flex items-center gap-1.5 px-4 py-2 bg-red-800 text-white text-xs font-medium rounded-lg hover:bg-red-900 whitespace-nowrap"
-        >
-          <UserPlus className="w-4 h-4" />
-          Tambah Akun Admin / Produksi
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          {hasCleanupTargets && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => {
+                setFeedback(null);
+                setConfirmCleanupOpen(true);
+              }}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 border border-red-300 bg-red-50 text-red-800 text-xs font-medium rounded-lg hover:bg-red-100 whitespace-nowrap disabled:opacity-50"
+            >
+              <Trash2 className="w-4 h-4" />
+              Hapus Pengguna Lain (Sisakan Owner)
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              setName('');
+              setEmail('');
+              setRole('PRODUKSI');
+              setDepartment('Produksi');
+              setActive(true);
+              setModalError(null);
+              setFeedback(null);
+              setShowInviteModal(true);
+            }}
+            className="inline-flex items-center gap-1.5 px-4 py-2 bg-red-800 text-white text-xs font-medium rounded-lg hover:bg-red-900 whitespace-nowrap"
+          >
+            <UserPlus className="w-4 h-4" />
+            Tambah / Otorisasi Pengguna
+          </button>
+        </div>
       </div>
 
       {/* Active Users Table */}
       <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-        <div className="px-5 py-3.5 border-b border-slate-200 text-sm font-semibold text-slate-900">
-          Pengguna Aktif Terdaftar ({users.length})
+        <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between gap-2">
+          <span className="text-sm font-semibold text-slate-900">
+            Pengguna Aktif / Terdaftar ({users.length})
+          </span>
+          {nonOwnerUsers.length === 0 && (
+            <span className="text-xs text-slate-500">Hanya akun Owner aktif</span>
+          )}
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-left text-sm">
@@ -135,20 +221,32 @@ export function UsersPage() {
                   <td className="px-4 py-3 text-slate-600">{u.department}</td>
                   <td className="px-4 py-3 text-xs">{u.active ? 'Aktif' : 'Nonaktif'}</td>
                   <td className="px-4 py-3 text-right">
-                    {u.role !== 'OWNER' && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setEditingUser(u);
-                          setName(u.name);
-                          setRole(u.role === 'ADMIN' ? 'ADMIN' : 'PRODUKSI');
-                          setDepartment(u.department);
-                          setActive(u.active);
-                        }}
-                        className="text-xs font-medium text-blue-700 hover:underline"
-                      >
-                        Ubah
-                      </button>
+                    {u.role !== 'OWNER' ? (
+                      <div className="inline-flex items-center gap-3">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditingUser(u);
+                            setName(u.name);
+                            setRole(u.role === 'ADMIN' ? 'ADMIN' : 'PRODUKSI');
+                            setDepartment(u.department);
+                            setActive(u.active);
+                            setModalError(null);
+                          }}
+                          className="text-xs font-medium text-blue-700 hover:underline"
+                        >
+                          Ubah
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setDeletingUser(u)}
+                          className="text-xs font-medium text-red-700 hover:underline"
+                        >
+                          Hapus
+                        </button>
+                      </div>
+                    ) : (
+                      <span className="text-xs text-slate-400">Owner Utama</span>
                     )}
                   </td>
                 </tr>
@@ -159,11 +257,15 @@ export function UsersPage() {
       </div>
 
       {/* Provisioned Invites */}
-      {invites.length > 0 && (
-        <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-          <div className="px-5 py-3.5 border-b border-slate-200 text-sm font-semibold text-slate-900">
-            Daftar Otorisasi / Undangan ({invites.length})
+      <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+        <div className="px-5 py-3.5 border-b border-slate-200 text-sm font-semibold text-slate-900">
+          Daftar Otorisasi / Undangan ({invites.length})
+        </div>
+        {invites.length === 0 ? (
+          <div className="p-6 text-center text-xs text-slate-500">
+            Belum ada undangan otorisasi pengguna baru.
           </div>
+        ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm">
               <thead className="bg-slate-50 border-b border-slate-200 text-xs text-slate-600">
@@ -172,6 +274,7 @@ export function UsersPage() {
                   <th className="px-4 py-3 font-medium">Email Diizinkan</th>
                   <th className="px-4 py-3 font-medium">Role</th>
                   <th className="px-4 py-3 font-medium">Status Klaim</th>
+                  <th className="px-4 py-3 font-medium text-right">Aksi</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
@@ -183,45 +286,75 @@ export function UsersPage() {
                     <td className="px-4 py-3 text-xs text-slate-600">
                       {inv.claimedUid ? 'Sudah Aktivasi' : 'Menunggu Login Pertama'} · {inv.active ? 'Aktif' : 'Nonaktif'}
                     </td>
+                    <td className="px-4 py-3 text-right">
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={async () => {
+                          setBusy(true);
+                          setFeedback(null);
+                          try {
+                            await deleteUserInvite(inv);
+                            setFeedback({ type: 'ok', text: `Undangan ${inv.email} berhasil dihapus.` });
+                          } catch (err) {
+                            setFeedback({
+                              type: 'err',
+                              text: err instanceof Error ? err.message : 'Gagal menghapus undangan.',
+                            });
+                          } finally {
+                            setBusy(false);
+                          }
+                        }}
+                        className="text-xs font-medium text-red-700 hover:underline disabled:opacity-50"
+                      >
+                        Hapus
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
-        </div>
-      )}
+        )}
+      </div>
 
       {/* Add User Invite Modal */}
       {showInviteModal && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
           <div className="bg-white border border-slate-200 rounded-xl w-full max-w-md p-6 space-y-4">
             <div className="flex items-center justify-between border-b border-slate-200 pb-3">
-              <h2 className="font-display text-base font-bold text-slate-900">
-                Otorisasi Akun Pengguna Baru
-              </h2>
-              <button type="button" aria-label="Tutup modal pengguna" onClick={() => setShowInviteModal(false)}>
+              <h2 className="font-display text-base font-bold text-slate-900">Otorisasi Akun Pengguna Baru</h2>
+              <button type="button" aria-label="Tutup modal undangan" onClick={() => setShowInviteModal(false)}>
                 <X className="w-5 h-5 text-slate-500" />
               </button>
             </div>
-            {feedback?.type === 'err' && (
-              <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-800">{feedback.text}</div>
+            {modalError && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-800">{modalError}</div>
             )}
-            <form onSubmit={handleSaveInvite} className="space-y-3">
+            <form onSubmit={handleCreateInvite} className="space-y-3">
               <div>
-                <label htmlFor="usr-name" className="block text-xs font-medium text-slate-700 mb-1">Nama Lengkap</label>
-                <input id="usr-name" required value={name} onChange={(e) => setName(e.target.value)} className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" />
+                <label htmlFor="inv-name" className="block text-xs font-medium text-slate-700 mb-1">Nama Lengkap</label>
+                <input id="inv-name" required value={name} onChange={(e) => setName(e.target.value)} className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" />
               </div>
               <div>
-                <label htmlFor="usr-email" className="block text-xs font-medium text-slate-700 mb-1">Email Google / Akun</label>
-                <input id="usr-email" type="email" required value={email} onChange={(e) => setEmail(e.target.value)} className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" />
+                <label htmlFor="inv-email" className="block text-xs font-medium text-slate-700 mb-1">Email Google / Akun</label>
+                <input id="inv-email" type="email" required value={email} onChange={(e) => setEmail(e.target.value)} className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" />
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label htmlFor="usr-role" className="block text-xs font-medium text-slate-700 mb-1">Role</label>
+                  <label htmlFor="inv-role" className="block text-xs font-medium text-slate-700 mb-1">Role</label>
                   <select
-                    id="usr-role"
+                    id="inv-role"
                     value={role}
-                    onChange={(e) => setRole(e.target.value as 'ADMIN' | 'PRODUKSI')}
+                    onChange={(e) => {
+                      const nextRole = e.target.value as 'ADMIN' | 'PRODUKSI';
+                      setRole(nextRole);
+                      if (department === 'Produksi' && nextRole === 'ADMIN') {
+                        setDepartment('Gudang');
+                      } else if (department === 'Gudang' && nextRole === 'PRODUKSI') {
+                        setDepartment('Produksi');
+                      }
+                    }}
                     className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white"
                   >
                     <option value="PRODUKSI">PRODUKSI</option>
@@ -229,15 +362,17 @@ export function UsersPage() {
                   </select>
                 </div>
                 <div>
-                  <label htmlFor="usr-dept" className="block text-xs font-medium text-slate-700 mb-1">Departemen</label>
-                  <input id="usr-dept" required value={department} onChange={(e) => setDepartment(e.target.value)} className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" />
+                  <label htmlFor="inv-dept" className="block text-xs font-medium text-slate-700 mb-1">Departemen</label>
+                  <input id="inv-dept" required value={department} onChange={(e) => setDepartment(e.target.value)} className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" />
                 </div>
               </div>
+              <label className="inline-flex items-center gap-2 text-sm text-slate-700">
+                <input type="checkbox" checked={active} onChange={(e) => setActive(e.target.checked)} />
+                Langsung Aktifkan Akun
+              </label>
               <div className="pt-2 flex justify-end gap-2">
                 <button type="button" onClick={() => setShowInviteModal(false)} className="px-4 py-2 border border-slate-300 text-sm rounded-lg">Batal</button>
-                <button type="submit" disabled={busy} className="px-4 py-2 bg-red-800 text-white text-sm font-medium rounded-lg">
-                  Simpan Otorisasi
-                </button>
+                <button type="submit" disabled={busy} className="px-4 py-2 bg-red-800 text-white text-sm font-medium rounded-lg">Simpan Otorisasi</button>
               </div>
             </form>
           </div>
@@ -249,15 +384,13 @@ export function UsersPage() {
         <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
           <div className="bg-white border border-slate-200 rounded-xl w-full max-w-md p-6 space-y-4">
             <div className="flex items-center justify-between border-b border-slate-200 pb-3">
-              <h2 className="font-display text-base font-bold text-slate-900">
-                Ubah Pengguna: {editingUser.email}
-              </h2>
+              <h2 className="font-display text-base font-bold text-slate-900">Ubah Pengguna: {editingUser.email}</h2>
               <button type="button" aria-label="Tutup modal edit pengguna" onClick={() => setEditingUser(null)}>
                 <X className="w-5 h-5 text-slate-500" />
               </button>
             </div>
-            {feedback?.type === 'err' && (
-              <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-800">{feedback.text}</div>
+            {modalError && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-800">{modalError}</div>
             )}
             <form onSubmit={handleUpdateUser} className="space-y-3">
               <div>
@@ -286,6 +419,78 @@ export function UsersPage() {
                 <button type="submit" disabled={busy} className="px-4 py-2 bg-red-800 text-white text-sm font-medium rounded-lg">Simpan Perubahan</button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Single Non-Owner User Confirmation Modal */}
+      {deletingUser && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-xl w-full max-w-md p-6 space-y-4">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="w-5 h-5 text-red-700 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <h2 className="font-display text-base font-bold text-slate-900">Hapus Akun Pengguna</h2>
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  Hapus akun <span className="font-semibold text-slate-900">{deletingUser.name}</span> ({deletingUser.email}, role {deletingUser.role})? Akses pengguna ini akan langsung dicabut.
+                </p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => setDeletingUser(null)}
+                className="px-4 py-2 border border-slate-300 text-sm rounded-lg"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => void handleConfirmDeleteUser()}
+                className="px-4 py-2 bg-red-800 text-white text-sm font-medium rounded-lg hover:bg-red-900 disabled:opacity-60"
+              >
+                {busy ? 'Menghapus...' : 'Ya, Hapus Akun'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Cleanup All Non-Owner Users Confirmation Modal */}
+      {confirmCleanupOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-xl w-full max-w-md p-6 space-y-4">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="w-5 h-5 text-red-700 shrink-0 mt-0.5" />
+              <div className="space-y-1.5">
+                <h2 className="font-display text-base font-bold text-slate-900">
+                  Hapus Semua Pengguna Lain?
+                </h2>
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  Tindakan ini akan menghapus <span className="font-semibold text-slate-900">{nonOwnerUsers.length} akun pengguna lain</span> dan <span className="font-semibold text-slate-900">{invites.length} undangan</span> dari database, mengosongkan slot Admin (0/1), serta menyisakan <span className="font-semibold text-slate-900">data Owner saja</span>. Riwayat transaksi &amp; stok barang tetap aman.
+                </p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => setConfirmCleanupOpen(false)}
+                className="px-4 py-2 border border-slate-300 text-sm rounded-lg"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => void handleConfirmCleanupNonOwners()}
+                className="px-4 py-2 bg-red-800 text-white text-sm font-medium rounded-lg hover:bg-red-900 disabled:opacity-60"
+              >
+                {busy ? 'Membersihkan...' : 'Ya, Sisakan Owner Saja'}
+              </button>
+            </div>
           </div>
         </div>
       )}

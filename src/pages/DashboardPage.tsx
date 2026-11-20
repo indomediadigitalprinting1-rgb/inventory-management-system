@@ -44,13 +44,13 @@ export function DashboardPage() {
     .filter((i) => i.active && i.currentStock <= i.minStock)
     .slice(0, 6);
   const latestLedger = [...ledger]
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))
     .slice(0, 7);
 
   if (currentUser.role === 'PRODUKSI') {
     const myRequests = requests
       .filter((r) => r.requesterUid === currentUser.uid)
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+      .sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''));
 
     const kpis = [
       { label: 'Total Permintaan', value: metrics.myTotalRequests },
@@ -137,7 +137,7 @@ export function DashboardPage() {
                         {r.requestNumber}
                       </td>
                       <td className="px-4 py-3 text-slate-600 tabular-nums whitespace-nowrap">
-                        {r.createdAt.slice(0, 10)}
+                        {(r.createdAt ?? '').slice(0, 10)}
                       </td>
                       <td className="px-4 py-3 text-slate-700">
                         {r.items
@@ -375,7 +375,7 @@ export function DashboardPage() {
                         {log.actorName} · {log.actorRole}
                       </span>
                       <span className="text-slate-400 tabular-nums">
-                        {log.createdAt.slice(0, 16).replace('T', ' ')}
+                        {(log.createdAt ?? '').slice(0, 16).replace('T', ' ')}
                       </span>
                     </div>
                     <p className="text-xs text-slate-600">{log.description}</p>
