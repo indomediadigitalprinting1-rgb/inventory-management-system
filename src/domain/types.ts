@@ -52,6 +52,8 @@ export interface AdminSlot {
 export interface UserAccount {
   uid: string;
   email: string;
+  username?: string;
+  authProvider?: 'GOOGLE' | 'USERNAME_PASSWORD';
   name: string;
   role: UserRole;
   department: string;

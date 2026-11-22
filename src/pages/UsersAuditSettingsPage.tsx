@@ -2,6 +2,7 @@ import React, { useMemo, useState } from 'react';
 import {
   AlertTriangle,
   Download,
+  KeyRound,
   Plus,
   ShieldCheck,
   SlidersHorizontal,
@@ -9,16 +10,26 @@ import {
   UserPlus,
   X,
 } from 'lucide-react';
-import { getNonOwnerUsers } from '../domain/rules';
+import {
+  getNonOwnerUsers,
+  internalAuthEmailToUsername,
+  isInternalStaffAuthEmail,
+} from '../domain/rules';
 import type { AdjustmentType, UserAccount, UserRole } from '../domain/types';
+import { OwnerUsernameAuthPanel } from '../components/OwnerUsernameAuthPanel';
+import { OwnerQuotaIndicator } from '../components/OwnerQuotaIndicator';
 import { useInventory } from '../services/inventoryContext';
 
 export function UsersPage() {
   const {
+    currentUser,
+    systemConfig,
     users,
     invites,
     adminSlot,
+    setActiveRoute,
     saveUserInvite,
+    createStaffUsernameAccount,
     updateUserAccountRoleOrStatus,
     deleteUserAccount,
     deleteUserInvite,
@@ -26,11 +37,14 @@ export function UsersPage() {
   } = useInventory();
 
   const [showInviteModal, setShowInviteModal] = useState(false);
+  const [accountMethod, setAccountMethod] = useState<'USERNAME_PASSWORD' | 'GOOGLE_EMAIL'>('USERNAME_PASSWORD');
   const [name, setName] = useState('');
+  const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
   const [role, setRole] = useState<'ADMIN' | 'PRODUKSI'>('PRODUKSI');
   const [department, setDepartment] = useState('Produksi');
   const [active, setActive] = useState(true);
+  const [initialPassword, setInitialPassword] = useState('');
   const [editingUser, setEditingUser] = useState<UserAccount | null>(null);
   const [deletingUser, setDeletingUser] = useState<UserAccount | null>(null);
   const [confirmCleanupOpen, setConfirmCleanupOpen] = useState(false);
@@ -42,23 +56,43 @@ export function UsersPage() {
   const hasCleanupTargets =
     nonOwnerUsers.length > 0 || invites.length > 0 || Boolean(adminSlot?.occupied);
 
-  const handleCreateInvite = async (e: React.FormEvent) => {
+  const handleCreateUserOrInvite = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true);
     setModalError(null);
     setFeedback(null);
     try {
-      await saveUserInvite({ name, email, role, department, active });
-      const savedEmail = email.trim().toLowerCase();
-      setShowInviteModal(false);
-      setName('');
-      setEmail('');
-      setFeedback({
-        type: 'ok',
-        text: `Otorisasi akun untuk ${savedEmail} (${role}) berhasil disimpan. Pengguna dapat langsung login dengan Google menggunakan email tersebut.`,
-      });
+      if (accountMethod === 'USERNAME_PASSWORD') {
+        const created = await createStaffUsernameAccount({
+          name,
+          username,
+          password: initialPassword,
+          role,
+          department,
+          active,
+        });
+        const uname = created.username ?? internalAuthEmailToUsername(created.email) ?? username.trim().toLowerCase();
+        setShowInviteModal(false);
+        setName('');
+        setUsername('');
+        setInitialPassword('');
+        setFeedback({
+          type: 'ok',
+          text: `Akun Username & Password "@${uname}" (${role}) berhasil dibuat oleh Owner. Staf dapat langsung login di komputer toko lewat tab Username & Password.`,
+        });
+      } else {
+        await saveUserInvite({ name, email, role, department, active });
+        const savedEmail = email.trim().toLowerCase();
+        setShowInviteModal(false);
+        setName('');
+        setEmail('');
+        setFeedback({
+          type: 'ok',
+          text: `Otorisasi akun Google untuk ${savedEmail} (${role}) berhasil disimpan. Pengguna dapat masuk melalui tab Akun Google.`,
+        });
+      }
     } catch (err) {
-      setModalError(err instanceof Error ? err.message : 'Gagal menyimpan otorisasi.');
+      setModalError(err instanceof Error ? err.message : 'Gagal menyimpan akun pengguna.');
     } finally {
       setBusy(false);
     }
@@ -151,11 +185,25 @@ export function UsersPage() {
           <p className="text-xs text-slate-600">
             Slot Admin Gudang (Maksimal 1):{' '}
             <span className="font-semibold text-slate-900">
-              {adminSlot?.occupied ? `Terisi (${adminSlot.adminEmail})` : 'Tersedia (0/1)'}
+              {adminSlot?.occupied
+                ? `Terisi (${
+                    internalAuthEmailToUsername(adminSlot.adminEmail)
+                      ? `@${internalAuthEmailToUsername(adminSlot.adminEmail)}`
+                      : adminSlot.adminEmail
+                  })`
+                : 'Tersedia (0/1)'}
             </span>
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setActiveRoute('settings')}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 border border-slate-300 bg-white text-slate-800 text-xs font-medium rounded-lg hover:bg-slate-50 whitespace-nowrap"
+          >
+            <KeyRound className="w-4 h-4 text-slate-600" />
+            Kelola Username &amp; Password
+          </button>
           {hasCleanupTargets && (
             <button
               type="button"
@@ -173,11 +221,14 @@ export function UsersPage() {
           <button
             type="button"
             onClick={() => {
+              setAccountMethod('USERNAME_PASSWORD');
               setName('');
+              setUsername('');
               setEmail('');
               setRole('PRODUKSI');
               setDepartment('Produksi');
               setActive(true);
+              setInitialPassword('');
               setModalError(null);
               setFeedback(null);
               setShowInviteModal(true);
@@ -205,7 +256,7 @@ export function UsersPage() {
             <thead className="bg-slate-50 border-b border-slate-200 text-xs text-slate-600">
               <tr>
                 <th className="px-4 py-3 font-medium">Nama</th>
-                <th className="px-4 py-3 font-medium">Email</th>
+                <th className="px-4 py-3 font-medium">Username / Email Login</th>
                 <th className="px-4 py-3 font-medium">Role</th>
                 <th className="px-4 py-3 font-medium">Departemen</th>
                 <th className="px-4 py-3 font-medium">Status</th>
@@ -213,10 +264,25 @@ export function UsersPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {users.map((u) => (
+              {users.map((u) => {
+                const staffUsername =
+                  u.username ??
+                  (isInternalStaffAuthEmail(u.email) ? internalAuthEmailToUsername(u.email) : null);
+                return (
                 <tr key={u.uid} className="hover:bg-slate-50/70">
                   <td className="px-4 py-3 font-medium text-slate-900">{u.name}</td>
-                  <td className="px-4 py-3 text-slate-600">{u.email}</td>
+                  <td className="px-4 py-3 text-slate-600">
+                    {staffUsername ? (
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="font-mono font-semibold text-slate-900">@{staffUsername}</span>
+                        <span className="text-[11px] px-1.5 py-0.5 bg-slate-100 text-slate-600 rounded">
+                          Username &amp; Password
+                        </span>
+                      </div>
+                    ) : (
+                      u.email
+                    )}
+                  </td>
                   <td className="px-4 py-3 font-mono text-xs font-semibold text-slate-800">{u.role}</td>
                   <td className="px-4 py-3 text-slate-600">{u.department}</td>
                   <td className="px-4 py-3 text-xs">{u.active ? 'Aktif' : 'Nonaktif'}</td>
@@ -245,12 +311,23 @@ export function UsersPage() {
                           Hapus
                         </button>
                       </div>
+                    ) : systemConfig?.ownerUid &&
+                      systemConfig.ownerUid === currentUser?.uid &&
+                      u.uid !== currentUser.uid ? (
+                      <button
+                        type="button"
+                        onClick={() => setDeletingUser(u)}
+                        className="text-xs font-medium text-red-700 hover:underline"
+                      >
+                        Hapus Owner Ganda
+                      </button>
                     ) : (
                       <span className="text-xs text-slate-400">Owner Utama</span>
                     )}
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -318,28 +395,94 @@ export function UsersPage() {
         )}
       </div>
 
-      {/* Add User Invite Modal */}
+      {/* Add User Modal */}
       {showInviteModal && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
           <div className="bg-white border border-slate-200 rounded-xl w-full max-w-md p-6 space-y-4">
             <div className="flex items-center justify-between border-b border-slate-200 pb-3">
-              <h2 className="font-display text-base font-bold text-slate-900">Otorisasi Akun Pengguna Baru</h2>
-              <button type="button" aria-label="Tutup modal undangan" onClick={() => setShowInviteModal(false)}>
+              <h2 className="font-display text-base font-bold text-slate-900">Tambah Akun Pengguna Baru</h2>
+              <button type="button" aria-label="Tutup modal tambah pengguna" onClick={() => setShowInviteModal(false)}>
                 <X className="w-5 h-5 text-slate-500" />
+              </button>
+            </div>
+            <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
+              <button
+                type="button"
+                onClick={() => {
+                  setAccountMethod('USERNAME_PASSWORD');
+                  setModalError(null);
+                }}
+                className={`flex-1 px-2.5 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                  accountMethod === 'USERNAME_PASSWORD'
+                    ? 'bg-white text-slate-900 shadow-sm'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                Username &amp; Password (Toko)
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setAccountMethod('GOOGLE_EMAIL');
+                  setModalError(null);
+                }}
+                className={`flex-1 px-2.5 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                  accountMethod === 'GOOGLE_EMAIL'
+                    ? 'bg-white text-slate-900 shadow-sm'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                Email Google
               </button>
             </div>
             {modalError && (
               <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-800">{modalError}</div>
             )}
-            <form onSubmit={handleCreateInvite} className="space-y-3">
+            <form onSubmit={handleCreateUserOrInvite} className="space-y-3">
               <div>
                 <label htmlFor="inv-name" className="block text-xs font-medium text-slate-700 mb-1">Nama Lengkap</label>
                 <input id="inv-name" required value={name} onChange={(e) => setName(e.target.value)} className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" />
               </div>
-              <div>
-                <label htmlFor="inv-email" className="block text-xs font-medium text-slate-700 mb-1">Email Google / Akun</label>
-                <input id="inv-email" type="email" required value={email} onChange={(e) => setEmail(e.target.value)} className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" />
-              </div>
+              {accountMethod === 'USERNAME_PASSWORD' ? (
+                <>
+                  <div>
+                    <label htmlFor="inv-username" className="block text-xs font-medium text-slate-700 mb-1">
+                      Username Login (Dibuat oleh Owner)
+                    </label>
+                    <input
+                      id="inv-username"
+                      type="text"
+                      required
+                      minLength={3}
+                      maxLength={32}
+                      value={username}
+                      onChange={(e) => setUsername(e.target.value.toLowerCase().replace(/\s+/g, ''))}
+                      placeholder="contoh: admin_gudang"
+                      className="w-full px-3 py-2 text-sm font-mono border border-slate-300 rounded-lg"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="inv-init-pass" className="block text-xs font-medium text-slate-700 mb-1">
+                      Kata Sandi Awal (Min. 6 karakter)
+                    </label>
+                    <input
+                      id="inv-init-pass"
+                      type="password"
+                      required
+                      minLength={6}
+                      value={initialPassword}
+                      onChange={(e) => setInitialPassword(e.target.value)}
+                      placeholder="Minimal 6 karakter"
+                      className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
+                    />
+                  </div>
+                </>
+              ) : (
+                <div>
+                  <label htmlFor="inv-email" className="block text-xs font-medium text-slate-700 mb-1">Email Akun Google</label>
+                  <input id="inv-email" type="email" required value={email} onChange={(e) => setEmail(e.target.value)} className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" />
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label htmlFor="inv-role" className="block text-xs font-medium text-slate-700 mb-1">Role</label>
@@ -372,7 +515,13 @@ export function UsersPage() {
               </label>
               <div className="pt-2 flex justify-end gap-2">
                 <button type="button" onClick={() => setShowInviteModal(false)} className="px-4 py-2 border border-slate-300 text-sm rounded-lg">Batal</button>
-                <button type="submit" disabled={busy} className="px-4 py-2 bg-red-800 text-white text-sm font-medium rounded-lg">Simpan Otorisasi</button>
+                <button type="submit" disabled={busy} className="px-4 py-2 bg-red-800 text-white text-sm font-medium rounded-lg">
+                  {busy
+                    ? 'Menyimpan...'
+                    : accountMethod === 'USERNAME_PASSWORD'
+                    ? 'Buat Akun Username'
+                    : 'Simpan Otorisasi Google'}
+                </button>
               </div>
             </form>
           </div>
@@ -654,6 +803,10 @@ export function SettingsPage() {
           </button>
         </div>
       )}
+
+      <OwnerQuotaIndicator variant="detailed" />
+
+      <OwnerUsernameAuthPanel />
 
       <div className="grid lg:grid-cols-12 gap-6">
         {/* General Settings & Backup */}

@@ -12,6 +12,7 @@ import {
 import { ArrowRight, DatabaseZap } from 'lucide-react';
 import { computeDashboardMetrics, computeStockFlowSeries } from '../domain/rules';
 import { useInventory } from '../services/inventoryContext';
+import { OwnerQuotaIndicator } from '../components/OwnerQuotaIndicator';
 import { RequestStatusLabel, StockHealthLabel } from '../components/StatusText';
 
 export function DashboardPage() {
@@ -238,6 +239,8 @@ export function DashboardPage() {
           </div>
         ))}
       </div>
+
+      {currentUser.role === 'OWNER' && <OwnerQuotaIndicator variant="compact" />}
 
       {/* Main Analytics Row */}
       <div className="grid lg:grid-cols-12 gap-6">

@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import {
   applyIncomingConfirmation,
   applyStockAdjustment,
+  bytesEqual,
   canAccessRoute,
   canAdjustStock,
   canDeleteCategory,
@@ -11,12 +13,21 @@ import {
   canDeleteSupplier,
   canDeleteUnit,
   CLOSED_TAB_SESSION_TIMEOUT_MS,
+  computeDatabaseCapacityReport,
   createIncomingReversal,
+  createStaffPasswordSecrets,
+  deriveStaffSessionSecrets,
+  determineUnregisteredLoginStage,
   filterVisibleNotifications,
+  formatBytesIndonesian,
+  formatFirebaseAuthErrorIndonesian,
   generateNextSequentialCode,
   getNonOwnerUsers,
   getRemainingReadMinutes,
+  internalAuthEmailToUsername,
+  isInternalStaffAuthEmail,
   isNotificationExpired,
+  normalizeUsername,
   parseSessionActivity,
   partitionDeletableCategories,
   partitionDeletableItems,
@@ -27,13 +38,18 @@ import {
   recordTabClosed,
   recordTabHeartbeat,
   reviewStockRequest,
+  sha256Hex,
   shouldExpireClosedTabSession,
   sortItemsByCode,
+  usernameToCredentialId,
+  usernameToInternalAuthEmail,
+  usernameToStaffUid,
   validateAdminSlotAvailability,
   validateCategoryUniqueness,
   validateItemUniqueness,
   validateSupplierUniqueness,
   validateUnitUniqueness,
+  validateUsernamePasswordInput,
 } from './rules';
 import type {
   IncomingTransaction,
@@ -811,5 +827,226 @@ test('Duplicate name checks block same-name supplier, unit, category, and same n
   );
 });
 
+test('computeDatabaseCapacityReport calculates document counts, status thresholds, storage estimate, and Firebase Console URLs', () => {
+  assert.equal(formatBytesIndonesian(512), '512 B');
+  assert.equal(formatBytesIndonesian(2048), '2,0 KB');
+  assert.equal(formatBytesIndonesian(2 * 1024 * 1024), '2,00 MB');
 
+  const safeReport = computeDatabaseCapacityReport({
+    masterCount: 50,
+    transactionCount: 120,
+    logAndNotifCount: 25,
+    accountCount: 5,
+    estimatedBytes: 200 * 1024,
+    projectId: 'unified-filament-sc70r',
+    firestoreDatabaseId: 'db-inv-1',
+  });
+  assert.equal(safeReport.totalDocs, 200);
+  assert.equal(safeReport.status, 'AMAN');
+  assert.equal(safeReport.estimatedReadsPerFullLogin, 200);
+  assert.equal(safeReport.estimatedMaxLoginsPerDaySpark, 250);
+  assert.equal(
+    safeReport.firebaseUsageUrl,
+    'https://console.firebase.google.com/project/unified-filament-sc70r/firestore/databases/db-inv-1/usage'
+  );
+  assert.equal(
+    safeReport.firebaseUpgradeUrl,
+    'https://console.firebase.google.com/project/unified-filament-sc70r/firestore/databases/db-inv-1/data?openUpgradeDialog=true'
+  );
 
+  const warningReport = computeDatabaseCapacityReport({
+    masterCount: 500,
+    transactionCount: 4200,
+    logAndNotifCount: 300,
+    accountCount: 10,
+  });
+  assert.equal(warningReport.totalDocs, 5010);
+  assert.equal(warningReport.status, 'PERHATIAN');
+
+  const denseReport = computeDatabaseCapacityReport({
+    masterCount: 1000,
+    transactionCount: 13500,
+    logAndNotifCount: 500,
+    accountCount: 20,
+  });
+  assert.equal(denseReport.totalDocs, 15020);
+  assert.equal(denseReport.status, 'PADAT');
+  assert.equal(denseReport.browserLoadPercent, 100);
+});
+
+test('determineUnregisteredLoginStage prioritizes invites, blocks hardcoded email hijack, and guards missing config', () => {
+  // 1. Invited active Admin -> CLAIM_INVITE even if config is missing or email was previously hardcoded
+  assert.equal(
+    determineUnregisteredLoginStage({
+      email: 'garasikosong2205@gmail.com',
+      configExists: true,
+      invite: { email: 'garasikosong2205@gmail.com', active: true },
+      adminSlotOccupied: true,
+    }),
+    'CLAIM_INVITE'
+  );
+  assert.equal(
+    determineUnregisteredLoginStage({
+      email: 'admin.gudang@perusahaan.co.id',
+      configExists: false,
+      invite: { email: 'admin.gudang@perusahaan.co.id', active: true },
+      adminSlotOccupied: true,
+    }),
+    'CLAIM_INVITE'
+  );
+
+  // 2. Deactivated invite -> INACTIVE_ACCOUNT (never NEEDS_OWNER_INIT)
+  assert.equal(
+    determineUnregisteredLoginStage({
+      email: 'admin.gudang@perusahaan.co.id',
+      configExists: false,
+      invite: { email: 'admin.gudang@perusahaan.co.id', active: false },
+      adminSlotOccupied: false,
+    }),
+    'INACTIVE_ACCOUNT'
+  );
+
+  // 3. Uninvited email when system/config already exists -> UNAUTHORIZED_NO_INVITE (even for previously hardcoded email)
+  assert.equal(
+    determineUnregisteredLoginStage({
+      email: 'garasikosong2205@gmail.com',
+      configExists: true,
+      invite: null,
+      adminSlotOccupied: false,
+    }),
+    'UNAUTHORIZED_NO_INVITE'
+  );
+
+  // 4. Uninvited email when config missing but adminSlot already occupied -> UNAUTHORIZED_NO_INVITE
+  assert.equal(
+    determineUnregisteredLoginStage({
+      email: 'orangasing@gmail.com',
+      configExists: false,
+      invite: null,
+      adminSlotOccupied: true,
+    }),
+    'UNAUTHORIZED_NO_INVITE'
+  );
+
+  // 5. Truly fresh uninitialized system -> NEEDS_OWNER_INIT
+  assert.equal(
+    determineUnregisteredLoginStage({
+      email: 'owner.baru@perusahaan.co.id',
+      configExists: false,
+      invite: null,
+      adminSlotOccupied: false,
+    }),
+    'NEEDS_OWNER_INIT'
+  );
+});
+
+test('Username/Password salted SHA-256 credentials, lossless IDs, validation, and error formatting', () => {
+  assert.equal(normalizeUsername('  Admin_Gudang.1 '), 'admin_gudang.1');
+  assert.equal(usernameToInternalAuthEmail('Admin_Gudang'), 'staff.admin_gudang@local.ims');
+  assert.equal(isInternalStaffAuthEmail('staff.admin_gudang@local.ims'), true);
+  assert.equal(isInternalStaffAuthEmail('owner@gmail.com'), false);
+  assert.equal(isInternalStaffAuthEmail('staff.admin@gmail.com'), false);
+  assert.equal(internalAuthEmailToUsername('staff.produksi_a@local.ims'), 'produksi_a');
+  assert.equal(internalAuthEmailToUsername('owner@gmail.com'), null);
+
+  // Pure-TS SHA-256 matches Node crypto SHA-256 identically for arbitrary inputs
+  for (const sample of ['', 'abc', 'rahasia123', 'salt123:admin_gudang:P@ssw0rd!']) {
+    const expected = crypto.createHash('sha256').update(sample, 'utf8').digest('hex');
+    assert.equal(sha256Hex(sample), expected);
+  }
+
+  // Lossless credential IDs and UIDs prevent collisions between dot and underscore
+  const idA = usernameToCredentialId('admin.1');
+  const idB = usernameToCredentialId('admin_1');
+  assert.notEqual(idA, idB);
+  assert.match(idA, /^[a-zA-Z0-9_-]+$/);
+  assert.match(idB, /^[a-zA-Z0-9_-]+$/);
+  assert.notEqual(usernameToStaffUid('admin.1'), usernameToStaffUid('admin_1'));
+  assert.match(usernameToStaffUid('admin.1'), /^[a-zA-Z0-9_-]+$/);
+
+  // Salted credential creation and verification
+  const stored = createStaffPasswordSecrets({
+    username: 'admin_gudang',
+    password: 'TokoPassword#1',
+  });
+  assert.equal(stored.verifierBytes.length, 32);
+  const validProof = deriveStaffSessionSecrets({
+    salt: stored.salt,
+    username: 'Admin_Gudang',
+    password: 'TokoPassword#1',
+  });
+  assert.equal(bytesEqual(validProof.verifierBytes, stored.verifierBytes), true);
+  assert.equal(
+    sha256Hex(validProof.credentialSecret),
+    Buffer.from(stored.verifierBytes).toString('hex')
+  );
+
+  const wrongPassProof = deriveStaffSessionSecrets({
+    salt: stored.salt,
+    username: 'admin_gudang',
+    password: 'salahPassword',
+  });
+  assert.equal(bytesEqual(wrongPassProof.verifierBytes, stored.verifierBytes), false);
+
+  assert.match(
+    formatFirebaseAuthErrorIndonesian(new Error('Firebase: Error (auth/invalid-credential).')),
+    /Username atau kata sandi salah/i
+  );
+
+  // Invalid username characters or too short
+  assert.equal(
+    validateUsernamePasswordInput({
+      name: 'Rina Gudang',
+      username: 'ab',
+      password: 'password123',
+    }).valid,
+    false
+  );
+  assert.equal(
+    validateUsernamePasswordInput({
+      name: 'Rina Gudang',
+      username: 'admin@toko',
+      password: 'password123',
+    }).valid,
+    false
+  );
+  // Short password & mismatch confirmPassword
+  assert.equal(
+    validateUsernamePasswordInput({
+      name: 'Rina Gudang',
+      username: 'admin_gudang',
+      password: '123',
+    }).valid,
+    false
+  );
+  assert.equal(
+    validateUsernamePasswordInput({
+      name: 'Rina Gudang',
+      username: 'admin_gudang',
+      password: 'password123',
+      confirmPassword: 'password124',
+    }).valid,
+    false
+  );
+  // Duplicate username blocked
+  assert.equal(
+    validateUsernamePasswordInput({
+      name: 'Rina Gudang',
+      username: 'Admin_Gudang',
+      password: 'password123',
+      confirmPassword: 'password123',
+      existingUsernames: ['admin_gudang'],
+    }).valid,
+    false
+  );
+  // Valid fresh Owner-created username + password
+  const validRes = validateUsernamePasswordInput({
+    name: 'Rina Gudang',
+    username: ' Admin_Gudang2 ',
+    password: 'password123',
+    confirmPassword: 'password123',
+    existingUsernames: ['admin_gudang'],
+  });
+  assert.equal(validRes.valid, true);
+  assert.equal(validRes.normalizedUsername, 'admin_gudang2');
+});

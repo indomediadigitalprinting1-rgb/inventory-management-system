@@ -3,12 +3,12 @@ import {
   GoogleAuthProvider,
   onAuthStateChanged,
   sendEmailVerification,
-  signInWithEmailAndPassword,
   signInWithPopup,
   signOut,
   type User as FirebaseUser,
 } from 'firebase/auth';
 import {
+  Bytes,
   collection,
   deleteDoc,
   doc,
@@ -25,10 +25,17 @@ import {
   writeBatch,
   type Unsubscribe,
 } from 'firebase/firestore';
-import { auth, db, handleFirestoreError, OperationType, testConnection } from '../firebase/config';
+import {
+  auth,
+  db,
+  handleFirestoreError,
+  OperationType,
+  testConnection,
+} from '../firebase/config';
 import {
   applyIncomingConfirmation,
   applyStockAdjustment,
+  bytesEqual,
   calculateIncomingTotal,
   canAdjustStock,
   canApproveOrDeliver,
@@ -43,12 +50,20 @@ import {
   canManageUsers,
   CLOSED_TAB_SESSION_TIMEOUT_MS,
   createIncomingReversal,
+  createStaffPasswordSecrets,
+  deriveStaffSessionSecrets,
+  determineUnregisteredLoginStage,
   emailToInviteId,
   filterVisibleNotifications,
+  formatFirebaseAuthErrorIndonesian,
   generateDocNumber,
   getNonOwnerUsers,
   getNotificationReadAt,
+  internalAuthEmailToUsername,
+  isInternalStaffAuthEmail,
+  isValidUsernameFormat,
   normalizeCodeKey,
+  normalizeUsername,
   parseSessionActivity,
   partitionDeletableCategories,
   partitionDeletableItems,
@@ -61,13 +76,18 @@ import {
   reviewStockRequest,
   sanitizeId,
   SESSION_ACTIVITY_STORAGE_KEY,
+  sha256Bytes,
   shouldExpireClosedTabSession,
   sortItemsByCode,
+  usernameToCredentialId,
+  usernameToInternalAuthEmail,
+  usernameToStaffUid,
   validateAdminSlotAvailability,
   validateCategoryUniqueness,
   validateItemUniqueness,
   validateSupplierUniqueness,
   validateUnitUniqueness,
+  validateUsernamePasswordInput,
 } from '../domain/rules';
 import type {
   AdjustmentType,
@@ -169,7 +189,17 @@ export interface InventoryContextValue {
 
   // Auth Actions
   loginWithGoogle: () => Promise<void>;
-  loginWithEmail: (email: string, password: string) => Promise<void>;
+  loginWithUsername: (username: string, password: string) => Promise<void>;
+  createStaffUsernameAccount: (input: {
+    name: string;
+    username: string;
+    password: string;
+    confirmPassword?: string;
+    role: 'ADMIN' | 'PRODUKSI';
+    department: string;
+    active: boolean;
+  }) => Promise<UserAccount>;
+  resetStaffUsernamePassword: (user: UserAccount, newPassword: string) => Promise<void>;
   resendVerificationEmail: () => Promise<void>;
   initializeFirstOwner: (companyName: string, ownerName: string) => Promise<void>;
   logout: () => Promise<void>;
@@ -307,6 +337,62 @@ function clearSessionActivityStorage() {
   }
 }
 
+const STAFF_SESSION_STORAGE_KEY = 'ims_staff_session_v1';
+
+interface StoredStaffSession {
+  uid: string;
+  credId: string;
+  username: string;
+  credentialSecret: string;
+}
+
+function readStaffSessionStorage(): StoredStaffSession | null {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return null;
+    const raw = window.localStorage.getItem(STAFF_SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<StoredStaffSession>;
+    if (
+      typeof parsed.uid === 'string' &&
+      typeof parsed.credId === 'string' &&
+      typeof parsed.username === 'string' &&
+      typeof parsed.credentialSecret === 'string'
+    ) {
+      return parsed as StoredStaffSession;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStaffSessionStorage(session: StoredStaffSession) {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    window.localStorage.setItem(STAFF_SESSION_STORAGE_KEY, JSON.stringify(session));
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+function clearStaffSessionStorage() {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    window.localStorage.removeItem(STAFF_SESSION_STORAGE_KEY);
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+function extractStoredVerifierBytes(raw: unknown): Uint8Array | null {
+  if (!raw) return null;
+  if (raw instanceof Uint8Array) return raw;
+  if (typeof (raw as { toUint8Array?: () => Uint8Array }).toUint8Array === 'function') {
+    return (raw as { toUint8Array: () => Uint8Array }).toUint8Array();
+  }
+  return null;
+}
+
 export function InventoryProvider({ children }: { children: React.ReactNode }) {
   const autostartRole = useMemo(() => getAutostartRole(), []);
   const isSandbox = autostartRole !== null;
@@ -409,20 +495,62 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
   // Resolve user profile on Firebase Auth change
   const resolveProfile = useCallback(async (fbUser: FirebaseUser) => {
     setAuthError(null);
-    if (!fbUser.emailVerified) {
+    const internalStaffAccount = isInternalStaffAuthEmail(fbUser.email);
+
+    if (!internalStaffAccount && !fbUser.emailVerified) {
       setAuthStage('EMAIL_UNVERIFIED');
       return;
     }
 
     try {
-      const configSnap = await getDoc(doc(db, 'system', 'config'));
+      // Owner-created Username+Password accounts: verify /users/{uid} FIRST before touching /system/config
+      if (internalStaffAccount) {
+        const userSnap = await getDoc(doc(db, 'users', fbUser.uid));
+        if (!userSnap.exists()) {
+          setAuthStage('UNAUTHORIZED_NO_INVITE');
+          return;
+        }
+        const account = normalizeDocDates(userSnap.data() as Record<string, unknown>) as unknown as UserAccount;
+        if (!account.active) {
+          setCurrentUser(account);
+          setAuthStage('INACTIVE_ACCOUNT');
+          return;
+        }
+        if (account.role === 'OWNER') {
+          setAuthStage('UNAUTHORIZED_NO_INVITE');
+          return;
+        }
+        try {
+          const configSnap = await getDoc(doc(db, 'system', 'config'));
+          if (configSnap.exists()) {
+            setSystemConfig(normalizeDocDates(configSnap.data() as Record<string, unknown>) as unknown as SystemConfig);
+          }
+        } catch {
+          // Non-fatal if config unavailable
+        }
+        setCurrentUser(account);
+        setAuthStage('READY');
+        await writeAuditLogFirestore(
+          account,
+          'LOGIN',
+          'AUTH',
+          account.uid,
+          `${account.name} (@${account.username ?? internalAuthEmailToUsername(account.email) ?? 'staf'}, ${account.role}) masuk ke sistem.`
+        );
+        return;
+      }
+
+      const [configSnap, userSnap] = await Promise.all([
+        getDoc(doc(db, 'system', 'config')),
+        getDoc(doc(db, 'users', fbUser.uid)),
+      ]);
+
       if (configSnap.exists()) {
         setSystemConfig(normalizeDocDates(configSnap.data() as Record<string, unknown>) as unknown as SystemConfig);
       } else {
         setSystemConfig(null);
       }
 
-      const userSnap = await getDoc(doc(db, 'users', fbUser.uid));
       if (userSnap.exists()) {
         const account = normalizeDocDates(userSnap.data() as Record<string, unknown>) as unknown as UserAccount;
         if (!account.active) {
@@ -430,65 +558,88 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
           setAuthStage('INACTIVE_ACCOUNT');
           return;
         }
+        // Auto-heal missing system/config when an active OWNER logs in so invited staff never see NEEDS_OWNER_INIT
+        if (account.role === 'OWNER' && !configSnap.exists()) {
+          const healedConfig: SystemConfig = {
+            initialized: true,
+            ownerUid: account.uid,
+            ownerEmail: account.email.toLowerCase(),
+            companyName: 'PT Manufaktur Nusantara',
+            lowStockAlertEnabled: true,
+            updatedAt: new Date().toISOString(),
+          };
+          try {
+            await setDoc(doc(db, 'system', 'config'), {
+              initialized: true,
+              ownerUid: account.uid,
+              ownerEmail: account.email.toLowerCase(),
+              companyName: healedConfig.companyName,
+              lowStockAlertEnabled: true,
+              updatedAt: serverTimestamp(),
+            });
+            setSystemConfig(healedConfig);
+          } catch {
+            // Keep Owner login working even if config auto-heal is blocked
+          }
+        }
         setCurrentUser(account);
         setAuthStage('READY');
         await writeAuditLogFirestore(account, 'LOGIN', 'AUTH', account.uid, `${account.name} (${account.role}) masuk ke sistem.`);
         return;
       }
 
-      // If no user doc yet: check if system uninitialized or bootstrapped owner email
-      const email = (fbUser.email ?? '').toLowerCase();
-      if (!configSnap.exists() || email === 'garasikosong2205@gmail.com') {
+      // If no user doc yet: ALWAYS check Owner-provisioned invite & adminSlot BEFORE NEEDS_OWNER_INIT
+      const email = (fbUser.email ?? '').trim().toLowerCase();
+      const inviteId = emailToInviteId(email);
+      const [inviteSnap, slotSnap] = await Promise.all([
+        getDoc(doc(db, 'userInvites', inviteId)),
+        getDoc(doc(db, 'system', 'adminSlot')),
+      ]);
+
+      const invite = inviteSnap.exists()
+        ? (normalizeDocDates(inviteSnap.data() as Record<string, unknown>) as unknown as UserInvite)
+        : null;
+      const adminSlotOccupied = slotSnap.exists() && Boolean((slotSnap.data() as AdminSlot).occupied);
+
+      const nextStage = determineUnregisteredLoginStage({
+        email,
+        configExists: configSnap.exists(),
+        invite,
+        adminSlotOccupied,
+      });
+
+      if (nextStage === 'NEEDS_OWNER_INIT') {
         setAuthStage('NEEDS_OWNER_INIT');
         return;
       }
-
-      // Check Owner-provisioned invite
-      const inviteId = emailToInviteId(email);
-      const inviteSnap = await getDoc(doc(db, 'userInvites', inviteId));
-      if (inviteSnap.exists()) {
-        const invite = normalizeDocDates(inviteSnap.data() as Record<string, unknown>) as unknown as UserInvite;
-        if (invite.active && invite.email.toLowerCase() === email) {
-          await runTransaction(db, async (tx) => {
-            if (invite.role === 'ADMIN') {
-              const slotRef = doc(db, 'system', 'adminSlot');
-              const slotSnap = await tx.get(slotRef);
-              if (slotSnap.exists()) {
-                const slot = slotSnap.data() as AdminSlot;
-                if (slot.occupied && slot.adminEmail && slot.adminEmail.toLowerCase() !== email) {
-                  throw new Error('Slot ADMIN sudah digunakan oleh pengguna lain.');
-                }
-                tx.update(slotRef, {
-                  adminUid: fbUser.uid,
-                  updatedAt: serverTimestamp(),
-                });
-              } else {
-                tx.set(slotRef, {
-                  occupied: true,
-                  adminUid: fbUser.uid,
-                  adminEmail: email,
-                  updatedAt: serverTimestamp(),
-                });
+      if (nextStage === 'INACTIVE_ACCOUNT') {
+        setAuthStage('INACTIVE_ACCOUNT');
+        return;
+      }
+      if (nextStage === 'CLAIM_INVITE' && invite) {
+        await runTransaction(db, async (tx) => {
+          if (invite.role === 'ADMIN') {
+            const slotRef = doc(db, 'system', 'adminSlot');
+            const txSlotSnap = await tx.get(slotRef);
+            if (txSlotSnap.exists()) {
+              const slot = txSlotSnap.data() as AdminSlot;
+              if (slot.occupied && slot.adminEmail && slot.adminEmail.toLowerCase() !== email) {
+                throw new Error('Slot ADMIN sudah digunakan oleh pengguna lain.');
               }
+              tx.update(slotRef, {
+                adminUid: fbUser.uid,
+                updatedAt: serverTimestamp(),
+              });
+            } else {
+              tx.set(slotRef, {
+                occupied: true,
+                adminUid: fbUser.uid,
+                adminEmail: email,
+                updatedAt: serverTimestamp(),
+              });
             }
-            tx.set(doc(db, 'users', fbUser.uid), {
-              uid: fbUser.uid,
-              email,
-              name: invite.name,
-              role: invite.role,
-              department: invite.department,
-              active: true,
-              inviteId: invite.id,
-              createdAt: serverTimestamp(),
-              updatedAt: serverTimestamp(),
-            });
-            tx.update(doc(db, 'userInvites', invite.id), {
-              claimedUid: fbUser.uid,
-              updatedAt: serverTimestamp(),
-            });
-          });
-
-          const newAccount: UserAccount = {
+          }
+          tx.set(doc(db, 'users', fbUser.uid), {
             uid: fbUser.uid,
             email,
             name: invite.name,
@@ -496,14 +647,30 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
             department: invite.department,
             active: true,
             inviteId: invite.id,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-          };
-          setCurrentUser(newAccount);
-          setAuthStage('READY');
-          await writeAuditLogFirestore(newAccount, 'LOGIN', 'AUTH', newAccount.uid, `${newAccount.name} (${newAccount.role}) aktivasi akun dan masuk.`);
-          return;
-        }
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+          tx.update(doc(db, 'userInvites', invite.id), {
+            claimedUid: fbUser.uid,
+            updatedAt: serverTimestamp(),
+          });
+        });
+
+        const newAccount: UserAccount = {
+          uid: fbUser.uid,
+          email,
+          name: invite.name,
+          role: invite.role,
+          department: invite.department,
+          active: true,
+          inviteId: invite.id,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        setCurrentUser(newAccount);
+        setAuthStage('READY');
+        await writeAuditLogFirestore(newAccount, 'LOGIN', 'AUTH', newAccount.uid, `${newAccount.name} (${newAccount.role}) aktivasi akun dan masuk.`);
+        return;
       }
 
       setAuthStage('UNAUTHORIZED_NO_INVITE');
@@ -513,11 +680,121 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
     }
   }, [writeAuditLogFirestore]);
 
+  const restoreStaffSession = useCallback(async (stored: StoredStaffSession) => {
+    setAuthError(null);
+    try {
+      const credSnap = await getDoc(doc(db, 'staffCredentials', stored.credId));
+      if (!credSnap.exists()) {
+        clearStaffSessionStorage();
+        setCurrentUser(null);
+        setActiveSessionUid(null);
+        setAuthStage('UNAUTHENTICATED');
+        return;
+      }
+      const credData = credSnap.data() as Record<string, unknown>;
+      const verifier = extractStoredVerifierBytes(credData.verifierBytes);
+      const expectedVerifier = sha256Bytes(stored.credentialSecret);
+      if (!verifier || !bytesEqual(expectedVerifier, verifier)) {
+        clearStaffSessionStorage();
+        setCurrentUser(null);
+        setActiveSessionUid(null);
+        setAuthError('Kata sandi akun telah diperbarui oleh Owner. Silakan masuk kembali.');
+        setAuthStage('UNAUTHENTICATED');
+        return;
+      }
+      if (!credData.active) {
+        clearStaffSessionStorage();
+        setCurrentUser(null);
+        setActiveSessionUid(null);
+        setAuthStage('INACTIVE_ACCOUNT');
+        return;
+      }
+
+      const username = String(credData.username ?? stored.username);
+      const role = credData.role as UserRole;
+      const uid = String(credData.uid ?? stored.uid);
+      if (role !== 'ADMIN' && role !== 'PRODUKSI') {
+        clearStaffSessionStorage();
+        setAuthStage('UNAUTHORIZED_NO_INVITE');
+        return;
+      }
+
+      await setDoc(doc(db, 'staffSessions', uid), {
+        uid,
+        credId: stored.credId,
+        username,
+        role,
+        credentialSecret: stored.credentialSecret,
+        updatedAt: serverTimestamp(),
+      });
+
+      try {
+        const configSnap = await getDoc(doc(db, 'system', 'config'));
+        if (configSnap.exists()) {
+          setSystemConfig(normalizeDocDates(configSnap.data() as Record<string, unknown>) as unknown as SystemConfig);
+        }
+      } catch {
+        // Non-fatal
+      }
+
+      const account: UserAccount = {
+        uid,
+        email: usernameToInternalAuthEmail(username),
+        username,
+        authProvider: 'USERNAME_PASSWORD',
+        name: String(credData.name ?? username),
+        role,
+        department: String(credData.department ?? (role === 'ADMIN' ? 'Gudang' : 'Produksi')),
+        active: true,
+        createdAt: toIso(credData.createdAt),
+        updatedAt: toIso(credData.updatedAt),
+      };
+
+      const snapshot = readSessionActivityStorage();
+      writeSessionActivityStorage(recordTabHeartbeat(snapshot, sessionTabIdRef.current, uid, Date.now()));
+      setActiveSessionUid(uid);
+      setCurrentUser(account);
+      setAuthStage('READY');
+    } catch {
+      clearStaffSessionStorage();
+      setCurrentUser(null);
+      setActiveSessionUid(null);
+      setAuthStage('UNAUTHENTICATED');
+    }
+  }, []);
+
   useEffect(() => {
     if (isSandbox) return;
     void testConnection();
     const unsub = onAuthStateChanged(auth, (fbUser) => {
       if (!fbUser) {
+        const storedStaff = readStaffSessionStorage();
+        if (storedStaff) {
+          const snapshot = readSessionActivityStorage();
+          if (
+            shouldExpireClosedTabSession({
+              snapshot,
+              uid: storedStaff.uid,
+              nowMs: Date.now(),
+              timeoutMs: CLOSED_TAB_SESSION_TIMEOUT_MS,
+            })
+          ) {
+            clearStaffSessionStorage();
+            clearSessionActivityStorage();
+            setActiveSessionUid(null);
+            setFirebaseUser(null);
+            setCurrentUser(null);
+            setAuthError(
+              'Sesi login otomatis berakhir karena seluruh tab aplikasi telah ditutup lebih dari 5 menit. Silakan masuk kembali.'
+            );
+            setAuthStage('UNAUTHENTICATED');
+            return;
+          }
+          setFirebaseUser(null);
+          setAuthStage('LOADING');
+          void restoreStaffSession(storedStaff);
+          return;
+        }
         setFirebaseUser(null);
         setActiveSessionUid(null);
         setCurrentUser(null);
@@ -525,6 +802,7 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
+      clearStaffSessionStorage();
       const snapshot = readSessionActivityStorage();
       if (
         shouldExpireClosedTabSession({
@@ -555,7 +833,7 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
       void resolveProfile(fbUser);
     });
     return () => unsub();
-  }, [isSandbox, resolveProfile]);
+  }, [isSandbox, resolveProfile, restoreStaffSession]);
 
   // Track open-tab heartbeats and record closure timestamp when tab/browser closes
   useEffect(() => {
@@ -645,7 +923,15 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
       listenCollection<DeliveryRecord>('deliveries', setDeliveries);
       listenCollection<StockAdjustment>('stockAdjustments', setAdjustments);
       listenCollection<StockLedgerEntry>('stockLedgers', setLedger);
-      listenCollection<UserAccount>('users', setUsers);
+      if (currentUser.role === 'ADMIN' && !firebaseUser) {
+        listenCollection<UserAccount>(
+          'users',
+          setUsers,
+          query(collection(db, 'users'), where('role', 'in', ['ADMIN', 'PRODUKSI']))
+        );
+      } else {
+        listenCollection<UserAccount>('users', setUsers);
+      }
 
       if (currentUser.role === 'ADMIN') {
         setInvites([]);
@@ -690,7 +976,7 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
     return () => {
       unsubs.forEach((u) => u());
     };
-  }, [authStage, currentUser, isSandbox]);
+  }, [authStage, currentUser, firebaseUser, isSandbox]);
 
   // Expose active data (either real Firestore or Sandbox)
   const effectiveSystemConfig = isSandbox ? sandboxState?.systemConfig ?? null : systemConfig;
@@ -768,24 +1054,374 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
   // Auth Actions
   const loginWithGoogle = useCallback(async () => {
     setAuthError(null);
+    clearStaffSessionStorage();
     clearSessionActivityStorage();
     try {
       const provider = new GoogleAuthProvider();
       await signInWithPopup(auth, provider);
     } catch (err) {
-      setAuthError(err instanceof Error ? err.message : 'Login Google dibatalkan atau gagal.');
+      setAuthError(formatFirebaseAuthErrorIndonesian(err));
     }
   }, []);
 
-  const loginWithEmail = useCallback(async (email: string, password: string) => {
-    setAuthError(null);
-    clearSessionActivityStorage();
-    try {
-      await signInWithEmailAndPassword(auth, email.trim(), password);
-    } catch (err) {
-      setAuthError(err instanceof Error ? err.message : 'Email atau kata sandi salah.');
-    }
-  }, []);
+  const loginWithUsername = useCallback(
+    async (username: string, password: string) => {
+      setAuthError(null);
+      clearSessionActivityStorage();
+      clearStaffSessionStorage();
+      const cleanUsername = normalizeUsername(username);
+      if (!isValidUsernameFormat(cleanUsername)) {
+        setAuthError(
+          'Format username tidak valid. Gunakan 3–32 karakter huruf kecil, angka, titik (.), garis bawah (_), atau tanda hubung (-).'
+        );
+        return;
+      }
+
+      try {
+        if (auth.currentUser) {
+          await signOut(auth).catch(() => {});
+        }
+        const credId = usernameToCredentialId(cleanUsername);
+        const credSnap = await getDoc(doc(db, 'staffCredentials', credId));
+        if (!credSnap.exists()) {
+          setAuthError('Username tidak ditemukan. Pastikan akun sudah dibuatkan oleh Owner.');
+          return;
+        }
+        const credData = credSnap.data() as Record<string, unknown>;
+        if (!credData.active) {
+          setAuthError('Akun Anda sedang dinonaktifkan oleh Owner.');
+          return;
+        }
+
+        const salt = String(credData.salt ?? '');
+        const storedVerifier = extractStoredVerifierBytes(credData.verifierBytes);
+        const { credentialSecret, verifierBytes } = deriveStaffSessionSecrets({
+          salt,
+          username: cleanUsername,
+          password,
+        });
+
+        if (!storedVerifier || !bytesEqual(verifierBytes, storedVerifier)) {
+          setAuthError('Username atau kata sandi salah.');
+          return;
+        }
+
+        const role = credData.role as UserRole;
+        const uid = String(credData.uid ?? usernameToStaffUid(cleanUsername));
+        if (role !== 'ADMIN' && role !== 'PRODUKSI') {
+          setAuthError('Role akun tidak valid. Hubungi Owner.');
+          return;
+        }
+
+        await setDoc(doc(db, 'staffSessions', uid), {
+          uid,
+          credId,
+          username: cleanUsername,
+          role,
+          credentialSecret,
+          updatedAt: serverTimestamp(),
+        });
+
+        writeStaffSessionStorage({
+          uid,
+          credId,
+          username: cleanUsername,
+          credentialSecret,
+        });
+        writeSessionActivityStorage(
+          recordTabHeartbeat(null, sessionTabIdRef.current, uid, Date.now())
+        );
+
+        try {
+          const configSnap = await getDoc(doc(db, 'system', 'config'));
+          if (configSnap.exists()) {
+            setSystemConfig(
+              normalizeDocDates(configSnap.data() as Record<string, unknown>) as unknown as SystemConfig
+            );
+          }
+        } catch {
+          // Non-fatal
+        }
+
+        const account: UserAccount = {
+          uid,
+          email: usernameToInternalAuthEmail(cleanUsername),
+          username: cleanUsername,
+          authProvider: 'USERNAME_PASSWORD',
+          name: String(credData.name ?? cleanUsername),
+          role,
+          department: String(credData.department ?? (role === 'ADMIN' ? 'Gudang' : 'Produksi')),
+          active: true,
+          createdAt: toIso(credData.createdAt),
+          updatedAt: toIso(credData.updatedAt),
+        };
+
+        setActiveSessionUid(uid);
+        setFirebaseUser(null);
+        setCurrentUser(account);
+        setAuthStage('READY');
+        await writeAuditLogFirestore(
+          account,
+          'LOGIN',
+          'AUTH',
+          account.uid,
+          `${account.name} (@${cleanUsername}, ${account.role}) masuk ke sistem.`
+        );
+      } catch (err) {
+        clearStaffSessionStorage();
+        setAuthError(formatFirebaseAuthErrorIndonesian(err));
+      }
+    },
+    [writeAuditLogFirestore]
+  );
+
+  const createStaffUsernameAccount = useCallback(
+    async (input: {
+      name: string;
+      username: string;
+      password: string;
+      confirmPassword?: string;
+      role: 'ADMIN' | 'PRODUKSI';
+      department: string;
+      active: boolean;
+    }): Promise<UserAccount> => {
+      if (!currentUser || !canManageUsers(currentUser.role)) {
+        throw new Error('Hanya OWNER yang dapat membuat akun Username & Password staf.');
+      }
+
+      const existingUsernames = effectiveUsers
+        .map((u) => u.username ?? internalAuthEmailToUsername(u.email))
+        .filter((u): u is string => Boolean(u));
+
+      const validation = validateUsernamePasswordInput({
+        name: input.name,
+        username: input.username,
+        password: input.password,
+        confirmPassword: input.confirmPassword,
+        existingUsernames,
+      });
+      if (!validation.valid) {
+        throw new Error(validation.error || 'Data username atau kata sandi tidak valid.');
+      }
+
+      const normUsername = validation.normalizedUsername;
+      const internalEmail = usernameToInternalAuthEmail(normUsername);
+      const credId = usernameToCredentialId(normUsername);
+      const uid = usernameToStaffUid(normUsername);
+      const dept = input.department.trim() || (input.role === 'ADMIN' ? 'Gudang' : 'Produksi');
+
+      const slotCheck = validateAdminSlotAvailability({
+        targetRole: input.role,
+        targetEmail: internalEmail,
+        adminSlot: effectiveAdminSlot,
+        existingUsers: effectiveUsers,
+        existingInvites: effectiveInvites,
+      });
+      if (!slotCheck.allowed) {
+        throw new Error(slotCheck.reason);
+      }
+
+      const nowIso = new Date().toISOString();
+
+      if (isSandbox) {
+        const sandboxUid = uid;
+        const newAccount: UserAccount = {
+          uid: sandboxUid,
+          email: internalEmail,
+          username: normUsername,
+          authProvider: 'USERNAME_PASSWORD',
+          name: input.name.trim(),
+          role: input.role,
+          department: dept,
+          active: input.active,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        };
+        setSandboxState((prev) => {
+          if (!prev) return prev;
+          const nextSlot: AdminSlot =
+            input.role === 'ADMIN' && input.active
+              ? { occupied: true, adminUid: sandboxUid, adminEmail: internalEmail, updatedAt: nowIso }
+              : prev.adminSlot;
+          return {
+            ...prev,
+            adminSlot: nextSlot,
+            users: [...prev.users, newAccount],
+            auditLogs: appendSandboxAudit(
+              prev,
+              currentUser,
+              'CREATE_STAFF_USERNAME',
+              'USER',
+              sandboxUid,
+              `Membuat akun login username @${normUsername} (${input.role}) untuk ${input.name.trim()}.`
+            ),
+          };
+        });
+        return newAccount;
+      }
+
+      const { salt, verifierBytes } = createStaffPasswordSecrets({
+        username: normUsername,
+        password: input.password,
+      });
+
+      try {
+        await runTransaction(db, async (tx) => {
+          const slotRef = doc(db, 'system', 'adminSlot');
+          const credRef = doc(db, 'staffCredentials', credId);
+          const userRef = doc(db, 'users', uid);
+          const [slotSnap, credSnap] = await Promise.all([tx.get(slotRef), tx.get(credRef)]);
+          if (credSnap.exists()) {
+            throw new Error(`Username "${normUsername}" sudah terdaftar. Gunakan username lain.`);
+          }
+          const currentSlot = slotSnap.exists()
+            ? (slotSnap.data() as AdminSlot)
+            : { occupied: false, adminUid: null, adminEmail: null };
+
+          if (input.role === 'ADMIN' && input.active) {
+            if (
+              currentSlot.occupied &&
+              currentSlot.adminEmail &&
+              currentSlot.adminEmail.toLowerCase() !== internalEmail
+            ) {
+              throw new Error(`Slot ADMIN sudah ditempati oleh ${currentSlot.adminEmail}. Maksimal hanya 1 Admin.`);
+            }
+            tx.set(
+              slotRef,
+              {
+                occupied: true,
+                adminUid: uid,
+                adminEmail: internalEmail,
+                updatedAt: serverTimestamp(),
+              },
+              { merge: true }
+            );
+          }
+
+          tx.set(userRef, {
+            uid,
+            email: internalEmail,
+            username: normUsername,
+            authProvider: 'USERNAME_PASSWORD',
+            name: input.name.trim(),
+            role: input.role,
+            department: dept,
+            active: input.active,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+
+          tx.set(credRef, {
+            id: credId,
+            uid,
+            username: normUsername,
+            name: input.name.trim(),
+            role: input.role,
+            department: dept,
+            active: input.active,
+            salt,
+            verifierBytes: Bytes.fromUint8Array(verifierBytes),
+            createdByUid: currentUser.uid,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.CREATE, `staffCredentials/${credId}`);
+      }
+
+      const createdAccount: UserAccount = {
+        uid,
+        email: internalEmail,
+        username: normUsername,
+        authProvider: 'USERNAME_PASSWORD',
+        name: input.name.trim(),
+        role: input.role,
+        department: dept,
+        active: input.active,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      await writeAuditLogFirestore(
+        currentUser,
+        'CREATE_STAFF_USERNAME',
+        'USER',
+        uid,
+        `Membuat akun login username @${normUsername} (${input.role}) untuk ${input.name.trim()}.`
+      );
+
+      return createdAccount;
+    },
+    [
+      appendSandboxAudit,
+      currentUser,
+      effectiveAdminSlot,
+      effectiveInvites,
+      effectiveUsers,
+      isSandbox,
+      writeAuditLogFirestore,
+    ]
+  );
+
+  const resetStaffUsernamePassword = useCallback(
+    async (user: UserAccount, newPassword: string) => {
+      if (!currentUser || !canManageUsers(currentUser.role)) {
+        throw new Error('Hanya OWNER yang dapat mengubah kata sandi staf.');
+      }
+      const uname = user.username ?? internalAuthEmailToUsername(user.email);
+      if (!uname) {
+        throw new Error('Akun ini login melalui Google dan tidak memiliki kata sandi internal.');
+      }
+      if (newPassword.length < 6) {
+        throw new Error('Kata sandi baru minimal harus 6 karakter.');
+      }
+
+      if (isSandbox) {
+        setSandboxState((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            auditLogs: appendSandboxAudit(
+              prev,
+              currentUser,
+              'RESET_STAFF_PASSWORD',
+              'USER',
+              user.uid,
+              `Memperbarui kata sandi untuk akun @${uname}.`
+            ),
+          };
+        });
+        return;
+      }
+
+      const credId = usernameToCredentialId(uname);
+      const { salt, verifierBytes } = createStaffPasswordSecrets({
+        username: uname,
+        password: newPassword,
+      });
+
+      try {
+        await updateDoc(doc(db, 'staffCredentials', credId), {
+          salt,
+          verifierBytes: Bytes.fromUint8Array(verifierBytes),
+          updatedAt: serverTimestamp(),
+        });
+        await deleteDoc(doc(db, 'staffSessions', user.uid)).catch(() => {});
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `staffCredentials/${credId}`);
+      }
+
+      await writeAuditLogFirestore(
+        currentUser,
+        'RESET_STAFF_PASSWORD',
+        'USER',
+        user.uid,
+        `Memperbarui kata sandi untuk akun @${uname}.`
+      );
+    },
+    [appendSandboxAudit, currentUser, isSandbox, writeAuditLogFirestore]
+  );
 
   const resendVerificationEmail = useCallback(async () => {
     if (!auth.currentUser) return;
@@ -794,12 +1430,36 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
 
   const initializeFirstOwner = useCallback(async (companyName: string, ownerName: string) => {
     if (!firebaseUser || !firebaseUser.email) throw new Error('Pengguna belum terautentikasi.');
-    const email = firebaseUser.email.toLowerCase();
+    const email = firebaseUser.email.trim().toLowerCase();
+    const inviteId = emailToInviteId(email);
     await runTransaction(db, async (tx) => {
       const configRef = doc(db, 'system', 'config');
       const slotRef = doc(db, 'system', 'adminSlot');
-      const [configSnap, slotSnap] = await Promise.all([tx.get(configRef), tx.get(slotRef)]);
-      if (!configSnap.exists()) {
+      const inviteRef = doc(db, 'userInvites', inviteId);
+      const [configSnap, slotSnap, inviteSnap] = await Promise.all([
+        tx.get(configRef),
+        tx.get(slotRef),
+        tx.get(inviteRef),
+      ]);
+
+      if (inviteSnap.exists()) {
+        throw new Error('Akun ini terdaftar pada undangan staf. Silakan muat ulang atau masuk ulang untuk mengaktifkan peran staf.');
+      }
+
+      if (configSnap.exists()) {
+        const existingCfg = configSnap.data() as Partial<SystemConfig>;
+        if (
+          existingCfg.ownerUid !== firebaseUser.uid &&
+          existingCfg.ownerEmail?.toLowerCase() !== email
+        ) {
+          throw new Error(
+            `Sistem sudah memiliki Owner utama terdaftar (${existingCfg.ownerEmail ?? 'Owner Utama'}).`
+          );
+        }
+      } else {
+        if (slotSnap.exists() && (slotSnap.data() as AdminSlot).occupied) {
+          throw new Error('Sistem sudah memiliki slot Admin aktif. Hubungi Owner utama yang sudah terdaftar.');
+        }
         tx.set(configRef, {
           initialized: true,
           ownerUid: firebaseUser.uid,
@@ -843,16 +1503,28 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
       window.location.href = window.location.pathname;
       return;
     }
+    const actor = currentUser;
+    const wasGoogleUser = Boolean(auth.currentUser);
     setActiveSessionUid(null);
     clearSessionActivityStorage();
-    if (currentUser) {
+    clearStaffSessionStorage();
+    if (actor) {
       try {
-        await writeAuditLogFirestore(currentUser, 'LOGOUT', 'AUTH', currentUser.uid, `${currentUser.name} (${currentUser.role}) keluar dari sistem.`);
+        await writeAuditLogFirestore(actor, 'LOGOUT', 'AUTH', actor.uid, `${actor.name} (${actor.role}) keluar dari sistem.`);
       } catch {
         // Ignore audit failure on logout
       }
+      if (!wasGoogleUser) {
+        await deleteDoc(doc(db, 'staffSessions', actor.uid)).catch(() => {});
+      }
     }
-    await signOut(auth);
+    if (wasGoogleUser) {
+      await signOut(auth);
+    } else {
+      setCurrentUser(null);
+      setFirebaseUser(null);
+      setAuthStage('UNAUTHENTICATED');
+    }
   }, [currentUser, isSandbox, writeAuditLogFirestore]);
 
   const seedStarterMasters = useCallback(async () => {
@@ -1082,9 +1754,16 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
+      const staffUname = user.username ?? internalAuthEmailToUsername(user.email);
+      const credId = staffUname ? usernameToCredentialId(staffUname) : null;
+
       await runTransaction(db, async (tx) => {
         const slotRef = doc(db, 'system', 'adminSlot');
-        const slotSnap = await tx.get(slotRef);
+        const credRef = credId ? doc(db, 'staffCredentials', credId) : null;
+        const [slotSnap, credSnap] = await Promise.all([
+          tx.get(slotRef),
+          credRef ? tx.get(credRef) : Promise.resolve(null),
+        ]);
         const currentSlot = slotSnap.exists() ? (slotSnap.data() as AdminSlot) : { occupied: false, adminUid: null, adminEmail: null };
 
         if (updates.role === 'ADMIN' && updates.active) {
@@ -1120,7 +1799,21 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
           active: updates.active,
           updatedAt: serverTimestamp(),
         });
+
+        if (credRef && credSnap?.exists() && (updates.role === 'ADMIN' || updates.role === 'PRODUKSI')) {
+          tx.update(credRef, {
+            name: updates.name.trim(),
+            role: updates.role,
+            department: updates.department.trim(),
+            active: updates.active,
+            updatedAt: serverTimestamp(),
+          });
+        }
       });
+
+      if (!updates.active || updates.role !== user.role) {
+        await deleteDoc(doc(db, 'staffSessions', user.uid)).catch(() => {});
+      }
 
       await writeAuditLogFirestore(
         currentUser,
@@ -1138,8 +1831,15 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
       if (!currentUser || !canManageUsers(currentUser.role)) {
         throw new Error('Hanya OWNER yang dapat menghapus akun pengguna.');
       }
-      if (user.role === 'OWNER' || user.uid === currentUser.uid) {
-        throw new Error('Akun Owner tidak dapat dihapus.');
+      const isPrimaryOwnerSelfOrRecord =
+        user.uid === currentUser.uid ||
+        (effectiveSystemConfig?.ownerUid ? user.uid === effectiveSystemConfig.ownerUid : user.role === 'OWNER');
+      const canRemoveDuplicateOwner =
+        user.role === 'OWNER' &&
+        Boolean(effectiveSystemConfig?.ownerUid && effectiveSystemConfig.ownerUid === currentUser.uid) &&
+        user.uid !== currentUser.uid;
+      if (isPrimaryOwnerSelfOrRecord || (user.role === 'OWNER' && !canRemoveDuplicateOwner)) {
+        throw new Error('Akun Owner utama tidak dapat dihapus.');
       }
 
       const nowIso = new Date().toISOString();
@@ -1170,15 +1870,20 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
+      const staffUname = user.username ?? internalAuthEmailToUsername(user.email);
+      const credId = staffUname ? usernameToCredentialId(staffUname) : null;
+
       try {
         await runTransaction(db, async (tx) => {
           const userRef = doc(db, 'users', user.uid);
           const slotRef = doc(db, 'system', 'adminSlot');
           const inviteRef = user.inviteId ? doc(db, 'userInvites', user.inviteId) : null;
+          const credRef = credId ? doc(db, 'staffCredentials', credId) : null;
 
-          const [slotSnap, inviteSnap] = await Promise.all([
+          const [slotSnap, inviteSnap, credSnap] = await Promise.all([
             tx.get(slotRef),
             inviteRef ? tx.get(inviteRef) : Promise.resolve(null),
+            credRef ? tx.get(credRef) : Promise.resolve(null),
           ]);
 
           if (slotSnap.exists()) {
@@ -1199,8 +1904,12 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
           if (inviteRef && inviteSnap?.exists()) {
             tx.delete(inviteRef);
           }
+          if (credRef && credSnap?.exists()) {
+            tx.delete(credRef);
+          }
           tx.delete(userRef);
         });
+        await deleteDoc(doc(db, 'staffSessions', user.uid)).catch(() => {});
       } catch (err) {
         handleFirestoreError(err, OperationType.DELETE, `users/${user.uid}`);
       }
@@ -1318,26 +2027,26 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
     }
 
     try {
-      const [usersSnap, invitesSnap, slotSnap] = await Promise.all([
+      const [usersSnap, invitesSnap, credsSnap, slotSnap] = await Promise.all([
         getDocs(collection(db, 'users')),
         getDocs(collection(db, 'userInvites')),
+        getDocs(collection(db, 'staffCredentials')),
         getDoc(doc(db, 'system', 'adminSlot')),
       ]);
 
-      const refsToDelete = [
-        ...usersSnap.docs
-          .filter((d) => {
-            const data = d.data() as Partial<UserAccount>;
-            return d.id !== currentUser.uid && data.role !== 'OWNER';
-          })
-          .map((d) => d.ref),
-        ...invitesSnap.docs.map((d) => d.ref),
-      ];
-
-      const deletedUsers = usersSnap.docs.filter((d) => {
+      const nonOwnerUserDocs = usersSnap.docs.filter((d) => {
         const data = d.data() as Partial<UserAccount>;
         return d.id !== currentUser.uid && data.role !== 'OWNER';
-      }).length;
+      });
+
+      const refsToDelete = [
+        ...nonOwnerUserDocs.map((d) => d.ref),
+        ...invitesSnap.docs.map((d) => d.ref),
+        ...credsSnap.docs.map((d) => d.ref),
+        ...nonOwnerUserDocs.map((d) => doc(db, 'staffSessions', d.id)),
+      ];
+
+      const deletedUsers = nonOwnerUserDocs.length;
       const deletedInvites = invitesSnap.docs.length;
 
       for (let i = 0; i < refsToDelete.length; i += 400) {
@@ -3529,7 +4238,9 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
     addToScannerDraftCart,
     clearScannerDraftCart,
     loginWithGoogle,
-    loginWithEmail,
+    loginWithUsername,
+    createStaffUsernameAccount,
+    resetStaffUsernamePassword,
     resendVerificationEmail,
     initializeFirstOwner,
     logout,

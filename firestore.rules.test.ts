@@ -43,11 +43,27 @@ test('firestore.rules enforces global deny, blueprint collection coverage, and D
   // Notifications support readAtBy timestamp tracking and scoped deletion
   assert.match(rules, /match \/notifications\/\{notifId\}[\s\S]*readAtBy[\s\S]*allow delete:/);
 
-  // Only Owner can delete non-owner users (never self or another OWNER) and invites
+  // Only Owner can manage users, invites, and staffCredentials; never self-delete
   assert.match(rules, /match \/users\/\{userId\}[\s\S]*allow delete: if isOwner\(\)[\s\S]*userId != request\.auth\.uid[\s\S]*existing\(\)\.role != 'OWNER'/);
   assert.match(rules, /match \/userInvites\/\{inviteId\}[\s\S]*allow delete: if isOwner\(\)/);
-  assert.ok(!rules.includes('isStaffPasswordAccount'), 'Username+password bypass should be removed');
-  assert.ok(!rules.includes('match /usernames/'), '/usernames collection should be removed');
+  assert.match(rules, /match \/staffCredentials\/\{credId\}[\s\S]*allow list: if isOwner\(\);[\s\S]*allow create: if isOwner\(\)/);
+  assert.match(rules, /match \/staffSessions\/\{sessionUid\}[\s\S]*allow read: if false;[\s\S]*hashing\.sha256\(incoming\(\)\.credentialSecret\)/);
+  assert.ok(!rules.includes('match /usernames/'), '/usernames collection should remain removed');
+  assert.ok(!rules.includes('passwordHash'), 'No plaintext or raw passwordHash fields in Firestore');
+  assert.ok(!rules.includes('isBootstrappedOwner'), 'Hardcoded bootstrapped owner bypass should be removed');
+  assert.ok(!rules.includes('garasikosong2205@gmail.com'), 'No hardcoded personal email should bypass role resolution');
+  assert.match(
+    rules,
+    /function isOwner\(\) \{\s*return isVerified\(\) && !isStaffPasswordEmail\(\) && hasUserDoc\(\) && userDoc\(\)\.active == true && userDoc\(\)\.role == 'OWNER';\s*\}/
+  );
+  assert.match(
+    rules,
+    /function isStaffSessionActive\(uid\) \{[\s\S]*exists\(\/databases\/\$\(database\)\/documents\/staffSessions\/\$\(uid\)\)[\s\S]*\/users\/\$\(uid\)/
+  );
+  assert.match(
+    rules,
+    /Path A: First Owner initialization[\s\S]*!exists\(\/databases\/\$\(database\)\/documents\/system\/config\)[\s\S]*!exists\(\/databases\/\$\(database\)\/documents\/userInvites\/\$\(myInviteId\(\)\)\)[\s\S]*adminSlot\)\.data\.occupied == false/
+  );
 
   // Ensure every top-level collection in blueprint is matched in firestore.rules
   const collections = Object.keys(blueprint.firestore).map((p) => p.split('/')[1]);

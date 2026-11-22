@@ -35,6 +35,13 @@ service cloud.firestore {
         && request.auth.token.email is string;
     }
 
+    function isStaffPasswordEmail() {
+      return isSignedIn()
+        && ('email' in request.auth.token)
+        && request.auth.token.email is string
+        && request.auth.token.email.lower().matches('^staff\\.[a-z0-9._\\-]{3,32}@local\\.ims$');
+    }
+
     function isValidId(id) {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
@@ -47,21 +54,20 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
     }
 
-    function isBootstrappedOwner() {
-      return isVerified() && request.auth.token.email == 'garasikosong2205@gmail.com';
+    function isAuthenticatedActor() {
+      return isVerified() && !isStaffPasswordEmail();
     }
 
     function isOwner() {
-      return isBootstrappedOwner() ||
-        (isVerified() && hasUserDoc() && userDoc().active == true && userDoc().role == 'OWNER');
+      return isVerified() && !isStaffPasswordEmail() && hasUserDoc() && userDoc().active == true && userDoc().role == 'OWNER';
     }
 
     function isAdmin() {
-      return isVerified() && hasUserDoc() && userDoc().active == true && userDoc().role == 'ADMIN';
+      return isAuthenticatedActor() && hasUserDoc() && userDoc().active == true && userDoc().role == 'ADMIN';
     }
 
     function isProduksi() {
-      return isVerified() && hasUserDoc() && userDoc().active == true && userDoc().role == 'PRODUKSI';
+      return isAuthenticatedActor() && hasUserDoc() && userDoc().active == true && userDoc().role == 'PRODUKSI';
     }
 
     function isManager() {
@@ -72,12 +78,34 @@ service cloud.firestore {
       return isOwner() || isAdmin() || isProduksi();
     }
 
+    // Shop-PC Username & Password sessions backed by server-side SHA-256 verification
+    function isStaffSessionActive(uid) {
+      return isValidId(uid)
+        && exists(/databases/$(database)/documents/staffSessions/$(uid))
+        && exists(/databases/$(database)/documents/users/$(uid))
+        && get(/databases/$(database)/documents/users/$(uid)).data.active == true
+        && get(/databases/$(database)/documents/users/$(uid)).data.role in ['ADMIN', 'PRODUKSI'];
+    }
+
+    function isStaffSessionAdmin(uid) {
+      return isStaffSessionActive(uid)
+        && get(/databases/$(database)/documents/users/$(uid)).data.role == 'ADMIN';
+    }
+
+    function isActiveSlotAdminSession() {
+      return exists(/databases/$(database)/documents/system/adminSlot)
+        && get(/databases/$(database)/documents/system/adminSlot).data.occupied == true
+        && get(/databases/$(database)/documents/system/adminSlot).data.adminUid is string
+        && isStaffSessionAdmin(get(/databases/$(database)/documents/system/adminSlot).data.adminUid);
+    }
+
     function myInviteId() {
       return request.auth.token.email.lower().replace('[^a-z0-9_-]', '_');
     }
 
     function hasActiveAdminInvite() {
       return isVerified()
+        && !isStaffPasswordEmail()
         && exists(/databases/$(database)/documents/userInvites/$(myInviteId()))
         && get(/databases/$(database)/documents/userInvites/$(myInviteId())).data.active == true
         && get(/databases/$(database)/documents/userInvites/$(myInviteId())).data.role == 'ADMIN'
@@ -109,9 +137,11 @@ service cloud.firestore {
 
     function isValidUserAccount(data) {
       return data.keys().hasAll(['uid', 'email', 'name', 'role', 'department', 'active', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['uid', 'email', 'name', 'role', 'department', 'active', 'inviteId', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'username', 'authProvider', 'name', 'role', 'department', 'active', 'inviteId', 'createdAt', 'updatedAt'])
         && data.uid is string && isValidId(data.uid)
         && data.email is string && data.email.size() >= 3 && data.email.size() <= 200
+        && (!('username' in data) || (data.username is string && data.username.size() >= 3 && data.username.size() <= 40 && data.username.matches('^[a-z0-9._\\-]{3,32}$')))
+        && (!('authProvider' in data) || data.authProvider in ['GOOGLE', 'USERNAME_PASSWORD'])
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 120
         && data.role in ['OWNER', 'ADMIN', 'PRODUKSI']
         && data.department is string && data.department.size() <= 80
@@ -133,6 +163,34 @@ service cloud.firestore {
         && (!('claimedUid' in data) || data.claimedUid == null || (data.claimedUid is string && data.claimedUid.size() <= 128))
         && data.createdByUid is string && isValidId(data.createdByUid)
         && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidStaffCredential(data) {
+      return data.keys().hasAll(['id', 'uid', 'username', 'name', 'role', 'department', 'active', 'salt', 'verifierBytes', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'uid', 'username', 'name', 'role', 'department', 'active', 'salt', 'verifierBytes', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.id is string && isValidId(data.id)
+        && data.uid is string && isValidId(data.uid)
+        && data.username is string && data.username.size() >= 3 && data.username.size() <= 40 && data.username.matches('^[a-z0-9._\\-]{3,32}$')
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 120
+        && data.role in ['ADMIN', 'PRODUKSI']
+        && data.department is string && data.department.size() <= 80
+        && data.active is bool
+        && data.salt is string && data.salt.size() >= 16 && data.salt.size() <= 64
+        && data.verifierBytes is bytes && data.verifierBytes.size() == 32
+        && data.createdByUid is string && isValidId(data.createdByUid)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidStaffSession(data) {
+      return data.keys().hasAll(['uid', 'credId', 'username', 'role', 'credentialSecret', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'credId', 'username', 'role', 'credentialSecret', 'updatedAt'])
+        && data.uid is string && isValidId(data.uid)
+        && data.credId is string && isValidId(data.credId)
+        && data.username is string && data.username.size() >= 3 && data.username.size() <= 40 && data.username.matches('^[a-z0-9._\\-]{3,32}$')
+        && data.role in ['ADMIN', 'PRODUKSI']
+        && data.credentialSecret is string && data.credentialSecret.size() == 64
         && data.updatedAt is timestamp;
     }
 
@@ -407,15 +465,23 @@ service cloud.firestore {
     // -------------------------------------------------------------------------
 
     match /system/{docId} {
-      allow get: if isVerified() && docId in ['config', 'adminSlot'];
+      allow get: if docId in ['config', 'adminSlot'];
 
-      allow create: if isVerified() && (
+      allow create: if isVerified() && !isStaffPasswordEmail() && (
         (docId == 'config'
           && isValidSystemConfig(incoming())
           && incoming().ownerUid == request.auth.uid
           && incoming().ownerEmail.lower() == request.auth.token.email.lower()
           && incoming().updatedAt == request.time
-          && !exists(/databases/$(database)/documents/system/config))
+          && !exists(/databases/$(database)/documents/system/config)
+          && (
+            isOwner()
+            || (
+              !exists(/databases/$(database)/documents/userInvites/$(myInviteId()))
+              && (!exists(/databases/$(database)/documents/system/adminSlot)
+                || get(/databases/$(database)/documents/system/adminSlot).data.occupied == false)
+            )
+          ))
         ||
         (docId == 'adminSlot'
           && isValidAdminSlot(incoming())
@@ -440,7 +506,7 @@ service cloud.firestore {
           ))
       );
 
-      allow update: if isVerified() && (
+      allow update: if isVerified() && !isStaffPasswordEmail() && (
         (docId == 'config'
           && isOwner()
           && isValidSystemConfig(incoming())
@@ -481,23 +547,33 @@ service cloud.firestore {
     }
 
     match /users/{userId} {
-      allow get: if isVerified() && isValidId(userId) && (request.auth.uid == userId || isManager());
-      allow list: if isVerified() && (isManager() || existing().uid == request.auth.uid);
+      allow get: if isValidId(userId) && (
+        (isVerified() && (request.auth.uid == userId || isManager()))
+        || isStaffSessionActive(userId)
+        || isActiveSlotAdminSession()
+      );
+      allow list: if isManager()
+        || existing().role in ['ADMIN', 'PRODUKSI']
+        || (isVerified() && existing().uid == request.auth.uid);
 
       allow create: if isVerified()
+        && !isStaffPasswordEmail()
         && isValidId(userId)
         && isValidUserAccount(incoming())
         && incoming().uid == userId
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time
         && (
-          // Path A: First Owner initialization or bootstrapped Owner
+          // Path A: First Owner initialization (blocked if config exists, invite exists, or adminSlot occupied)
           (userId == request.auth.uid
             && incoming().role == 'OWNER'
             && incoming().email.lower() == request.auth.token.email.lower()
-            && (isBootstrappedOwner() || !exists(/databases/$(database)/documents/system/config)))
+            && !exists(/databases/$(database)/documents/system/config)
+            && !exists(/databases/$(database)/documents/userInvites/$(myInviteId()))
+            && (!exists(/databases/$(database)/documents/system/adminSlot)
+              || get(/databases/$(database)/documents/system/adminSlot).data.occupied == false))
           ||
-          // Path B: Claiming an Owner-provisioned invite matching verified email & role
+          // Path B: Claiming an Owner-provisioned Google invite matching verified email & role
           (userId == request.auth.uid
             && ('inviteId' in incoming())
             && isValidId(incoming().inviteId)
@@ -512,8 +588,9 @@ service cloud.firestore {
                 && getAfter(/databases/$(database)/documents/system/adminSlot).data.adminEmail.lower() == request.auth.token.email.lower())
             ))
           ||
-          // Path C: Owner directly registering a user document
+          // Path C: Owner directly registering a staff user document (Username & Password staff)
           (isOwner()
+            && incoming().role in ['ADMIN', 'PRODUKSI']
             && (
               incoming().role != 'ADMIN' ||
               incoming().active == false ||
@@ -523,7 +600,7 @@ service cloud.firestore {
             ))
         );
 
-      allow update: if isVerified()
+      allow update: if isAuthenticatedActor()
         && isValidId(userId)
         && isValidUserAccount(incoming())
         && incoming().uid == existing().uid
@@ -547,7 +624,13 @@ service cloud.firestore {
       allow delete: if isOwner()
         && isValidId(userId)
         && userId != request.auth.uid
-        && existing().role != 'OWNER';
+        && (
+          existing().role != 'OWNER'
+          || (
+            exists(/databases/$(database)/documents/system/config)
+            && get(/databases/$(database)/documents/system/config).data.ownerUid == request.auth.uid
+          )
+        );
     }
 
     match /userInvites/{inviteId} {
@@ -600,16 +683,63 @@ service cloud.firestore {
       allow delete: if isOwner() && isValidId(inviteId);
     }
 
+    match /staffCredentials/{credId} {
+      allow get: if isValidId(credId) && credId.matches('^cred_[a-z0-9_\\-]+$');
+      allow list: if isOwner();
+
+      allow create: if isOwner()
+        && isValidId(credId)
+        && isValidStaffCredential(incoming())
+        && incoming().id == credId
+        && incoming().createdByUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && !exists(/databases/$(database)/documents/staffCredentials/$(credId));
+
+      allow update: if isOwner()
+        && isValidId(credId)
+        && isValidStaffCredential(incoming())
+        && incoming().id == existing().id
+        && incoming().uid == existing().uid
+        && incoming().username == existing().username
+        && incoming().createdByUid == existing().createdByUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'role', 'department', 'active', 'salt', 'verifierBytes', 'updatedAt']);
+
+      allow delete: if isOwner() && isValidId(credId);
+    }
+
+    match /staffSessions/{sessionUid} {
+      allow read: if false;
+
+      allow create, update: if isValidId(sessionUid)
+        && isValidStaffSession(incoming())
+        && incoming().uid == sessionUid
+        && incoming().updatedAt == request.time
+        && exists(/databases/$(database)/documents/staffCredentials/$(incoming().credId))
+        && get(/databases/$(database)/documents/staffCredentials/$(incoming().credId)).data.uid == sessionUid
+        && get(/databases/$(database)/documents/staffCredentials/$(incoming().credId)).data.username == incoming().username
+        && get(/databases/$(database)/documents/staffCredentials/$(incoming().credId)).data.role == incoming().role
+        && get(/databases/$(database)/documents/staffCredentials/$(incoming().credId)).data.active == true
+        && hashing.sha256(incoming().credentialSecret) == get(/databases/$(database)/documents/staffCredentials/$(incoming().credId)).data.verifierBytes
+        && exists(/databases/$(database)/documents/users/$(sessionUid))
+        && get(/databases/$(database)/documents/users/$(sessionUid)).data.active == true
+        && get(/databases/$(database)/documents/users/$(sessionUid)).data.role == incoming().role;
+
+      allow delete: if isOwner() || (isValidId(sessionUid) && exists(/databases/$(database)/documents/staffSessions/$(sessionUid)));
+    }
+
     match /categories/{categoryId} {
-      allow get: if isActiveStaff() && isValidId(categoryId);
-      allow list: if isActiveStaff();
-      allow create: if isManager()
+      allow get: if isValidId(categoryId) && (isActiveStaff() || existing().id is string);
+      allow list: if isActiveStaff() || existing().id is string;
+      allow create: if (isManager() || isActiveSlotAdminSession())
         && isValidId(categoryId)
         && isValidCategory(incoming())
         && incoming().id == categoryId
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time;
-      allow update: if isManager()
+      allow update: if (isManager() || isActiveSlotAdminSession())
         && isValidId(categoryId)
         && isValidCategory(incoming())
         && incoming().id == existing().id
@@ -620,8 +750,8 @@ service cloud.firestore {
     }
 
     match /units/{unitId} {
-      allow get: if isActiveStaff() && isValidId(unitId);
-      allow list: if isActiveStaff();
+      allow get: if isValidId(unitId) && (isActiveStaff() || existing().id is string);
+      allow list: if isActiveStaff() || existing().id is string;
       allow create: if isOwner()
         && isValidId(unitId)
         && isValidUnit(incoming())
@@ -639,15 +769,15 @@ service cloud.firestore {
     }
 
     match /suppliers/{supplierId} {
-      allow get: if isManager() && isValidId(supplierId);
-      allow list: if isManager();
-      allow create: if isManager()
+      allow get: if isValidId(supplierId) && (isManager() || isActiveSlotAdminSession());
+      allow list: if isManager() || existing().id is string;
+      allow create: if (isManager() || isActiveSlotAdminSession())
         && isValidId(supplierId)
         && isValidSupplier(incoming())
         && incoming().id == supplierId
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time;
-      allow update: if isManager()
+      allow update: if (isManager() || isActiveSlotAdminSession())
         && isValidId(supplierId)
         && isValidSupplier(incoming())
         && incoming().id == existing().id
@@ -658,13 +788,15 @@ service cloud.firestore {
     }
 
     match /items/{itemId} {
-      allow get: if isActiveStaff() && isValidId(itemId);
-      allow list: if isActiveStaff();
-      allow create: if isManager()
-        && isValidId(itemId)
+      allow get: if isValidId(itemId) && (isActiveStaff() || existing().id is string);
+      allow list: if isActiveStaff() || existing().id is string;
+      allow create: if isValidId(itemId)
         && isValidItem(incoming())
         && incoming().id == itemId
-        && incoming().createdByUid == request.auth.uid
+        && (
+          (isManager() && incoming().createdByUid == request.auth.uid) ||
+          (isActiveSlotAdminSession() && isStaffSessionAdmin(incoming().createdByUid))
+        )
         && incoming().currentStock == incoming().initialStock
         && incoming().hasTransactions == false
         && incoming().createdAt == request.time
@@ -673,7 +805,7 @@ service cloud.firestore {
         && exists(/databases/$(database)/documents/units/$(incoming().unitId))
         && exists(/databases/$(database)/documents/suppliers/$(incoming().supplierId));
 
-      allow update: if isManager()
+      allow update: if (isManager() || isActiveSlotAdminSession())
         && isValidId(itemId)
         && isValidItem(incoming())
         && incoming().id == existing().id
@@ -681,7 +813,6 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (
-          // Action 1: Master fields edit (cannot directly overwrite currentStock via master edit)
           (incoming().currentStock == existing().currentStock
             && incoming().hasTransactions == existing().hasTransactions
             && incoming().diff(existing()).affectedKeys().hasOnly([
@@ -690,7 +821,6 @@ service cloud.firestore {
               'purchasePrice', 'supplierId', 'supplierName', 'active', 'updatedAt'
             ]))
           ||
-          // Action 2: Stock movement via confirmed incoming/delivery/adjustment
           (incoming().diff(existing()).affectedKeys().hasOnly(['currentStock', 'hasTransactions', 'updatedAt'])
             && incoming().currentStock >= 0
             && incoming().hasTransactions == true)
@@ -702,52 +832,56 @@ service cloud.firestore {
     }
 
     match /itemCodes/{codeKey} {
-      allow get: if isManager() && isValidId(codeKey);
-      allow create: if isManager()
+      allow get: if (isManager() || isActiveSlotAdminSession()) && isValidId(codeKey);
+      allow create: if (isManager() || isActiveSlotAdminSession())
         && isValidId(codeKey)
         && isValidUniqueCodeLock(incoming())
         && incoming().createdAt == request.time
         && !exists(/databases/$(database)/documents/itemCodes/$(codeKey));
-      allow update: if isManager()
+      allow update: if (isManager() || isActiveSlotAdminSession())
         && isValidId(codeKey)
         && isValidUniqueCodeLock(incoming())
         && incoming().itemId == existing().itemId
         && incoming().createdAt == request.time
         && incoming().diff(existing()).affectedKeys().hasOnly(['value', 'createdAt']);
-      allow delete: if isManager() && isValidId(codeKey);
+      allow delete: if (isManager() || isActiveSlotAdminSession()) && isValidId(codeKey);
     }
 
     match /itemBarcodes/{barcodeKey} {
-      allow get: if isManager() && isValidId(barcodeKey);
-      allow create: if isManager()
+      allow get: if (isManager() || isActiveSlotAdminSession()) && isValidId(barcodeKey);
+      allow create: if (isManager() || isActiveSlotAdminSession())
         && isValidId(barcodeKey)
         && isValidUniqueCodeLock(incoming())
         && incoming().createdAt == request.time
         && !exists(/databases/$(database)/documents/itemBarcodes/$(barcodeKey));
-      allow update: if isManager()
+      allow update: if (isManager() || isActiveSlotAdminSession())
         && isValidId(barcodeKey)
         && isValidUniqueCodeLock(incoming())
         && incoming().itemId == existing().itemId
         && incoming().createdAt == request.time
         && incoming().diff(existing()).affectedKeys().hasOnly(['value', 'createdAt']);
-      allow delete: if isManager() && isValidId(barcodeKey);
+      allow delete: if (isManager() || isActiveSlotAdminSession()) && isValidId(barcodeKey);
     }
 
     match /incomingTransactions/{txId} {
-      allow get: if isManager() && isValidId(txId);
-      allow list: if isManager();
-      allow create: if isManager()
-        && isValidId(txId)
+      allow get: if isValidId(txId) && (isManager() || isActiveSlotAdminSession());
+      allow list: if isManager() || existing().id is string;
+      allow create: if isValidId(txId)
         && isValidIncomingTransaction(incoming())
         && incoming().id == txId
-        && incoming().createdByUid == request.auth.uid
+        && (
+          (isManager() && incoming().createdByUid == request.auth.uid
+            && (incoming().status == 'DRAFT' || (incoming().confirmedByUid == request.auth.uid && incoming().confirmedAt == request.time)))
+          ||
+          (isActiveSlotAdminSession() && isStaffSessionAdmin(incoming().createdByUid)
+            && (incoming().status == 'DRAFT' || (incoming().confirmedByUid == incoming().createdByUid && incoming().confirmedAt == request.time)))
+        )
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time
-        && (incoming().status == 'DRAFT' || (incoming().confirmedByUid == request.auth.uid && incoming().confirmedAt == request.time))
         && exists(/databases/$(database)/documents/suppliers/$(incoming().supplierId))
         && existsAfter(/databases/$(database)/documents/idempotencyKeys/$(incoming().idempotencyKey));
 
-      allow update: if isManager()
+      allow update: if (isManager() || isActiveSlotAdminSession())
         && isValidId(txId)
         && isValidIncomingTransaction(incoming())
         && incoming().id == existing().id
@@ -756,19 +890,16 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (
-          // Edit Draft before confirmation
           (existing().status == 'DRAFT'
             && incoming().status == 'DRAFT'
             && incoming().diff(existing()).affectedKeys().hasOnly(['date', 'supplierId', 'supplierName', 'items', 'totalAmount', 'notes', 'updatedAt']))
           ||
-          // Confirm Draft -> Confirmed
           (existing().status == 'DRAFT'
             && incoming().status == 'CONFIRMED'
-            && incoming().confirmedByUid == request.auth.uid
+            && ((isManager() && incoming().confirmedByUid == request.auth.uid) || (isActiveSlotAdminSession() && isStaffSessionAdmin(incoming().confirmedByUid)))
             && incoming().confirmedAt == request.time
             && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'confirmedByUid', 'confirmedByName', 'confirmedAt', 'updatedAt']))
           ||
-          // Mark Confirmed -> Reversed when reversal entry created
           (existing().status == 'CONFIRMED'
             && incoming().status == 'REVERSED'
             && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
@@ -776,22 +907,23 @@ service cloud.firestore {
     }
 
     match /stockRequests/{requestId} {
-      allow get: if isActiveStaff() && isValidId(requestId)
-        && (isManager() || existing().requesterUid == request.auth.uid);
-      allow list: if isActiveStaff()
-        && (isManager() || existing().requesterUid == request.auth.uid);
+      allow get: if isValidId(requestId) && (
+        (isActiveStaff() && (isManager() || existing().requesterUid == request.auth.uid))
+        || isActiveSlotAdminSession()
+        || isStaffSessionActive(existing().requesterUid)
+      );
+      allow list: if (isActiveStaff() && (isManager() || existing().requesterUid == request.auth.uid))
+        || existing().requesterUid is string;
 
-      allow create: if isActiveStaff()
-        && isValidId(requestId)
+      allow create: if isValidId(requestId)
         && isValidStockRequest(incoming())
         && incoming().id == requestId
-        && incoming().requesterUid == request.auth.uid
+        && ((isActiveStaff() && incoming().requesterUid == request.auth.uid) || isStaffSessionActive(incoming().requesterUid))
         && incoming().status == 'MENUNGGU_PERSETUJUAN'
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time;
 
-      allow update: if isActiveStaff()
-        && isValidId(requestId)
+      allow update: if isValidId(requestId)
         && isValidStockRequest(incoming())
         && incoming().id == existing().id
         && incoming().requestNumber == existing().requestNumber
@@ -800,60 +932,59 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && !(existing().status in ['SELESAI', 'DITOLAK', 'DIBATALKAN'])
         && (
-          // Manager: Approve / Ready / Reject
-          (isManager()
+          ((isManager() || isActiveSlotAdminSession())
             && existing().status == 'MENUNGGU_PERSETUJUAN'
             && incoming().status in ['DISETUJUI', 'SIAP_DIAMBIL', 'DITOLAK']
             && (incoming().status != 'DITOLAK' || (incoming().rejectionReason is string && incoming().rejectionReason.size() >= 3))
-            && incoming().approvedByUid == request.auth.uid
+            && ((isManager() && incoming().approvedByUid == request.auth.uid) || (isActiveSlotAdminSession() && isStaffSessionAdmin(incoming().approvedByUid)))
             && incoming().approvedAt == request.time
             && incoming().diff(existing()).affectedKeys().hasOnly([
               'status', 'items', 'approvedByUid', 'approvedByName',
               'approvedAt', 'rejectionReason', 'updatedAt'
             ]))
           ||
-          // Manager: Update delivery progress (requires atomic delivery creation)
-          (isManager()
+          ((isManager() || isActiveSlotAdminSession())
             && existing().status in ['DISETUJUI', 'SIAP_DIAMBIL', 'DALAM_PROSES_PENGAMBILAN']
             && incoming().status in ['DALAM_PROSES_PENGAMBILAN', 'SELESAI']
             && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'items', 'updatedAt']))
           ||
-          // Requester or Manager: Cancel while still waiting
-          ((isManager() || existing().requesterUid == request.auth.uid)
+          ((isManager() || isActiveSlotAdminSession() || (isActiveStaff() && existing().requesterUid == request.auth.uid) || isStaffSessionActive(existing().requesterUid))
             && existing().status == 'MENUNGGU_PERSETUJUAN'
             && incoming().status == 'DIBATALKAN'
             && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
         );
 
-      allow delete: if isActiveStaff()
-        && isValidId(requestId)
+      allow delete: if isValidId(requestId)
         && existing().status in ['MENUNGGU_PERSETUJUAN', 'DISETUJUI', 'SIAP_DIAMBIL', 'DITOLAK', 'DIBATALKAN']
         && (
           isOwner()
-          || (isAdmin() && existing().status in ['MENUNGGU_PERSETUJUAN', 'DITOLAK', 'DIBATALKAN'])
-          || (existing().requesterUid == request.auth.uid && existing().status in ['MENUNGGU_PERSETUJUAN', 'DIBATALKAN'])
+          || ((isAdmin() || isActiveSlotAdminSession()) && existing().status in ['MENUNGGU_PERSETUJUAN', 'DITOLAK', 'DIBATALKAN'])
+          || (((isActiveStaff() && existing().requesterUid == request.auth.uid) || isStaffSessionActive(existing().requesterUid))
+            && existing().status in ['MENUNGGU_PERSETUJUAN', 'DIBATALKAN'])
         );
     }
 
     match /deliveries/{deliveryId} {
-      allow get: if isActiveStaff() && isValidId(deliveryId)
-        && (isManager() || existing().requesterUid == request.auth.uid);
-      allow list: if isActiveStaff()
-        && (isManager() || existing().requesterUid == request.auth.uid);
+      allow get: if isValidId(deliveryId) && (
+        (isActiveStaff() && (isManager() || existing().requesterUid == request.auth.uid))
+        || isActiveSlotAdminSession()
+        || isStaffSessionActive(existing().requesterUid)
+      );
+      allow list: if (isActiveStaff() && (isManager() || existing().requesterUid == request.auth.uid))
+        || existing().requesterUid is string;
 
-      allow create: if isManager()
-        && isValidId(deliveryId)
+      allow create: if isValidId(deliveryId)
         && isValidDeliveryRecord(incoming())
         && incoming().id == deliveryId
-        && incoming().deliveredByUid == request.auth.uid
+        && ((isManager() && incoming().deliveredByUid == request.auth.uid) || (isActiveSlotAdminSession() && isStaffSessionAdmin(incoming().deliveredByUid)))
         && incoming().createdAt == request.time
         && exists(/databases/$(database)/documents/stockRequests/$(incoming().requestId))
         && existsAfter(/databases/$(database)/documents/idempotencyKeys/$(incoming().idempotencyKey));
     }
 
     match /stockAdjustments/{adjId} {
-      allow get: if isManager() && isValidId(adjId);
-      allow list: if isManager();
+      allow get: if isValidId(adjId) && (isManager() || isActiveSlotAdminSession());
+      allow list: if isManager() || existing().id is string;
       allow create: if isOwner()
         && isValidId(adjId)
         && isValidStockAdjustment(incoming())
@@ -865,78 +996,95 @@ service cloud.firestore {
     }
 
     match /stockLedgers/{ledgerId} {
-      allow get: if isManager() && isValidId(ledgerId);
-      allow list: if isManager();
-      allow create: if isManager()
-        && isValidId(ledgerId)
+      allow get: if isValidId(ledgerId) && (isManager() || isActiveSlotAdminSession());
+      allow list: if isManager() || existing().id is string;
+      allow create: if isValidId(ledgerId)
         && isValidStockLedgerEntry(incoming())
         && incoming().id == ledgerId
-        && incoming().userId == request.auth.uid
+        && ((isManager() && incoming().userId == request.auth.uid) || (isActiveSlotAdminSession() && isStaffSessionAdmin(incoming().userId)))
         && incoming().createdAt == request.time
         && exists(/databases/$(database)/documents/items/$(incoming().itemId));
     }
 
     match /notifications/{notifId} {
-      allow get: if isActiveStaff() && isValidId(notifId) && (
+      allow get: if isValidId(notifId) && (
         isOwner()
         || (isAdmin() && (existing().targetRole == 'ADMIN' || existing().targetUid == request.auth.uid))
         || (isProduksi() && existing().targetUid == request.auth.uid)
+        || (isActiveSlotAdminSession() && (existing().targetRole == 'ADMIN' || existing().targetUid == get(/databases/$(database)/documents/system/adminSlot).data.adminUid))
+        || (existing().targetUid is string && isStaffSessionActive(existing().targetUid))
       );
-      allow list: if isActiveStaff() && (
-        isOwner()
+      allow list: if isOwner()
         || (isAdmin() && (existing().targetRole == 'ADMIN' || existing().targetUid == request.auth.uid))
         || (isProduksi() && existing().targetUid == request.auth.uid)
-      );
-      allow create: if isActiveStaff()
-        && isValidId(notifId)
+        || existing().targetRole == 'ADMIN'
+        || existing().targetUid is string;
+
+      allow create: if isValidId(notifId)
         && isValidNotification(incoming())
         && incoming().id == notifId
-        && incoming().createdAt == request.time;
-      allow update: if isActiveStaff()
-        && isValidId(notifId)
+        && incoming().createdAt == request.time
+        && (
+          isActiveStaff()
+          || isActiveSlotAdminSession()
+          || (incoming().targetRole in ['ADMIN', 'OWNER'] && exists(/databases/$(database)/documents/system/config))
+        );
+
+      allow update: if isValidId(notifId)
         && isValidNotification(incoming())
         && incoming().id == existing().id
         && incoming().createdAt == existing().createdAt
-        && (
-          isOwner()
-          || (isAdmin() && (existing().targetRole == 'ADMIN' || existing().targetUid == request.auth.uid))
-          || (isProduksi() && existing().targetUid == request.auth.uid)
-        )
         && incoming().diff(existing()).affectedKeys().hasOnly(['readBy', 'readAtBy'])
         && incoming().readBy.hasAll(existing().readBy)
-        && request.auth.uid in incoming().readBy
         && incoming().readAtBy is map
-        && request.auth.uid in incoming().readAtBy
-        && incoming().readAtBy[request.auth.uid] == request.time
         && (
-          ('readAtBy' in existing() && existing().readAtBy is map && incoming().readAtBy.diff(existing().readAtBy).affectedKeys().hasOnly([request.auth.uid]))
-          || ((!('readAtBy' in existing()) || !(existing().readAtBy is map)) && incoming().readAtBy.keys().hasOnly([request.auth.uid]))
+          (isActiveStaff()
+            && (isOwner() || (isAdmin() && (existing().targetRole == 'ADMIN' || existing().targetUid == request.auth.uid)) || (isProduksi() && existing().targetUid == request.auth.uid))
+            && request.auth.uid in incoming().readBy
+            && request.auth.uid in incoming().readAtBy
+            && incoming().readAtBy[request.auth.uid] == request.time
+            && (
+              ('readAtBy' in existing() && existing().readAtBy is map && incoming().readAtBy.diff(existing().readAtBy).affectedKeys().hasOnly([request.auth.uid]))
+              || ((!('readAtBy' in existing()) || !(existing().readAtBy is map)) && incoming().readAtBy.keys().hasOnly([request.auth.uid]))
+            ))
+          ||
+          (isActiveSlotAdminSession()
+            && (existing().targetRole == 'ADMIN' || existing().targetUid == get(/databases/$(database)/documents/system/adminSlot).data.adminUid)
+            && get(/databases/$(database)/documents/system/adminSlot).data.adminUid in incoming().readBy
+            && get(/databases/$(database)/documents/system/adminSlot).data.adminUid in incoming().readAtBy
+            && incoming().readAtBy[get(/databases/$(database)/documents/system/adminSlot).data.adminUid] == request.time)
+          ||
+          (existing().targetUid is string
+            && isStaffSessionActive(existing().targetUid)
+            && existing().targetUid in incoming().readBy
+            && existing().targetUid in incoming().readAtBy
+            && incoming().readAtBy[existing().targetUid] == request.time)
         );
-      allow delete: if isActiveStaff() && isValidId(notifId) && (
+
+      allow delete: if isValidId(notifId) && (
         isOwner()
-        || (isAdmin() && (existing().targetRole == 'ADMIN' || existing().targetUid == request.auth.uid))
+        || ((isAdmin() || isActiveSlotAdminSession()) && existing().targetRole == 'ADMIN')
         || (isProduksi() && existing().targetUid == request.auth.uid)
+        || (existing().targetUid is string && isStaffSessionActive(existing().targetUid))
       );
     }
 
     match /auditLogs/{logId} {
       allow get: if isOwner() && isValidId(logId);
       allow list: if isOwner();
-      allow create: if isVerified()
-        && isValidId(logId)
+      allow create: if isValidId(logId)
         && isValidAuditLog(incoming())
         && incoming().id == logId
-        && incoming().actorUid == request.auth.uid
+        && ((isAuthenticatedActor() && incoming().actorUid == request.auth.uid) || isStaffSessionActive(incoming().actorUid))
         && incoming().createdAt == request.time;
     }
 
     match /idempotencyKeys/{key} {
-      allow get: if isManager() && isValidId(key);
-      allow create: if isManager()
-        && isValidId(key)
+      allow get: if (isManager() || isActiveSlotAdminSession()) && isValidId(key);
+      allow create: if isValidId(key)
         && isValidIdempotencyKey(incoming())
         && incoming().key == key
-        && incoming().actorUid == request.auth.uid
+        && ((isManager() && incoming().actorUid == request.auth.uid) || (isActiveSlotAdminSession() && isStaffSessionAdmin(incoming().actorUid)))
         && incoming().createdAt == request.time
         && !exists(/databases/$(database)/documents/idempotencyKeys/$(key));
     }

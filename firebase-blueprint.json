@@ -33,6 +33,8 @@
       "properties": {
         "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "email": { "type": "string", "maxLength": 200 },
+        "username": { "type": "string", "maxLength": 40, "pattern": "^[a-z0-9._\\-]{3,32}$" },
+        "authProvider": { "type": "string", "enum": ["GOOGLE", "USERNAME_PASSWORD"] },
         "name": { "type": "string", "maxLength": 120 },
         "role": { "type": "string", "enum": ["OWNER", "ADMIN", "PRODUKSI"] },
         "department": { "type": "string", "maxLength": 80 },
@@ -344,6 +346,40 @@
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["key", "operation", "actorUid", "createdAt"]
+    },
+    "StaffCredential": {
+      "title": "StaffCredential",
+      "description": "Owner-provisioned staff username and salted SHA-256 credential verifier.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "username": { "type": "string", "maxLength": 40, "pattern": "^[a-z0-9._\\-]{3,32}$" },
+        "name": { "type": "string", "maxLength": 120 },
+        "role": { "type": "string", "enum": ["ADMIN", "PRODUKSI"] },
+        "department": { "type": "string", "maxLength": 80 },
+        "active": { "type": "boolean" },
+        "salt": { "type": "string", "maxLength": 64 },
+        "verifierBytes": { "type": "string", "format": "byte" },
+        "createdByUid": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "uid", "username", "name", "role", "department", "active", "salt", "verifierBytes", "createdByUid", "createdAt", "updatedAt"]
+    },
+    "StaffSession": {
+      "title": "StaffSession",
+      "description": "Write-only server-verified session proof created when staff authenticate with username and password.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "credId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "username": { "type": "string", "maxLength": 40, "pattern": "^[a-z0-9._\\-]{3,32}$" },
+        "role": { "type": "string", "enum": ["ADMIN", "PRODUKSI"] },
+        "credentialSecret": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "credId", "username", "role", "credentialSecret", "updatedAt"]
     }
   },
   "firestore": {
@@ -362,6 +398,14 @@
     "/userInvites/{inviteId}": {
       "schema": { "$ref": "#/entities/UserInvite" },
       "description": "Owner-provisioned user authorizations indexed by sanitized email."
+    },
+    "/staffCredentials/{credId}": {
+      "schema": { "$ref": "#/entities/StaffCredential" },
+      "description": "Owner-managed staff username and salted SHA-256 verifier records."
+    },
+    "/staffSessions/{sessionUid}": {
+      "schema": { "$ref": "#/entities/StaffSession" },
+      "description": "Cryptographically verified active staff sessions for shop terminal logins."
     },
     "/categories/{categoryId}": {
       "schema": { "$ref": "#/entities/Category" },
