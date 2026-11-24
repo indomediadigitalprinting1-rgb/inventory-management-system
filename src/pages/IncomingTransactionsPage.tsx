@@ -59,6 +59,7 @@ export function IncomingTransactionsPage() {
     text: string;
   } | null>(null);
   const [cameraActive, setCameraActive] = useState(false);
+  const [cameraReady, setCameraReady] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
 
   const scanInputRef = useRef<HTMLInputElement | null>(null);
@@ -70,10 +71,17 @@ export function IncomingTransactionsPage() {
   autoAddRef.current = autoAddOnScan;
   const pickerQtyRef = useRef(pickerQty);
   pickerQtyRef.current = pickerQty;
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
 
   const stopCamera = useCallback(() => {
     controlsRef.current?.stop();
     controlsRef.current = null;
+    if (videoRef.current?.srcObject instanceof MediaStream) {
+      videoRef.current.srcObject.getTracks().forEach((t) => t.stop());
+      videoRef.current.srcObject = null;
+    }
+    setCameraReady(false);
     setCameraActive(false);
   }, []);
 
@@ -82,13 +90,6 @@ export function IncomingTransactionsPage() {
       stopCamera();
     }
   }, [modalMode, stopCamera]);
-
-  useEffect(() => {
-    return () => {
-      controlsRef.current?.stop();
-      controlsRef.current = null;
-    };
-  }, []);
 
   const filtered = useMemo(() => {
     return incoming
@@ -181,7 +182,108 @@ export function IncomingTransactionsPage() {
     [applyMatchedMasterItem, items, scanQuery]
   );
 
-  const startCamera = async () => {
+  const applyMatchedRef = useRef(applyMatchedMasterItem);
+  applyMatchedRef.current = applyMatchedMasterItem;
+
+  useEffect(() => {
+    if (!cameraActive || modalMode !== 'form') {
+      return;
+    }
+
+    let cancelled = false;
+    const reader = new BrowserMultiFormatReader();
+
+    const startStream = async () => {
+      const videoEl = videoRef.current;
+      if (!videoEl) {
+        setCameraActive(false);
+        setCameraError('Elemen video kamera belum siap. Silakan coba klik Buka Kamera kembali.');
+        return;
+      }
+
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setCameraActive(false);
+        setCameraError(
+          'Kamera tidak tersedia pada browser ini atau halaman belum diakses melalui HTTPS. Gunakan input Scanner USB / ketik barcode.'
+        );
+        return;
+      }
+
+      const handleDecode = (result: { getText: () => string } | undefined) => {
+        if (!result || cancelled) return;
+        const text = result.getText().trim();
+        if (!text) return;
+
+        const now = Date.now();
+        if (
+          lastCameraScanRef.current.code === text.toUpperCase() &&
+          now - lastCameraScanRef.current.ts < 1500
+        ) {
+          return;
+        }
+        lastCameraScanRef.current = { code: text.toUpperCase(), ts: now };
+
+        const found = findMasterItemByBarcodeOrCode(itemsRef.current, text);
+        if (found) {
+          applyMatchedRef.current(found, true);
+        } else {
+          setScanStatus({
+            type: 'err',
+            text: `Hasil scan kamera "${text}" belum terdaftar di Master Data Barang.`,
+          });
+        }
+      };
+
+      try {
+        let controls: IScannerControls;
+        try {
+          controls = await reader.decodeFromConstraints(
+            { audio: false, video: { facingMode: { ideal: 'environment' } } },
+            videoEl,
+            (result) => handleDecode(result)
+          );
+        } catch {
+          controls = await reader.decodeFromConstraints(
+            { audio: false, video: true },
+            videoEl,
+            (result) => handleDecode(result)
+          );
+        }
+
+        if (cancelled) {
+          controls.stop();
+          return;
+        }
+
+        controlsRef.current = controls;
+        setCameraReady(true);
+      } catch (err) {
+        if (cancelled) return;
+        setCameraReady(false);
+        setCameraActive(false);
+        setCameraError(
+          err instanceof Error
+            ? `Izin kamera ditolak atau kamera tidak dapat dibuka (${err.message}). Gunakan input Scanner USB / ketik barcode.`
+            : 'Gagal membuka kamera perangkat. Gunakan input Scanner USB / ketik barcode.'
+        );
+      }
+    };
+
+    void startStream();
+
+    return () => {
+      cancelled = true;
+      controlsRef.current?.stop();
+      controlsRef.current = null;
+      if (videoRef.current?.srcObject instanceof MediaStream) {
+        videoRef.current.srcObject.getTracks().forEach((t) => t.stop());
+        videoRef.current.srcObject = null;
+      }
+      setCameraReady(false);
+    };
+  }, [cameraActive, modalMode]);
+
+  const startCamera = () => {
     setCameraError(null);
     setScanStatus(null);
 
@@ -192,57 +294,8 @@ export function IncomingTransactionsPage() {
       return;
     }
 
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' } },
-      });
-      stream.getTracks().forEach((t) => t.stop());
-
-      const devices = await BrowserMultiFormatReader.listVideoInputDevices();
-      const rearCamera =
-        devices.find((d) => /back|rear|environment/i.test(d.label)) ?? devices[devices.length - 1];
-
-      const reader = new BrowserMultiFormatReader();
-      setCameraActive(true);
-
-      if (!videoRef.current) return;
-      const controls = await reader.decodeFromVideoDevice(
-        rearCamera?.deviceId,
-        videoRef.current,
-        (result) => {
-          if (!result) return;
-          const text = result.getText().trim();
-          if (!text) return;
-
-          const now = Date.now();
-          if (
-            lastCameraScanRef.current.code === text.toUpperCase() &&
-            now - lastCameraScanRef.current.ts < 1500
-          ) {
-            return;
-          }
-          lastCameraScanRef.current = { code: text.toUpperCase(), ts: now };
-
-          const found = findMasterItemByBarcodeOrCode(items, text);
-          if (found) {
-            applyMatchedMasterItem(found, true);
-          } else {
-            setScanStatus({
-              type: 'err',
-              text: `Hasil scan kamera "${text}" belum terdaftar di Master Data Barang.`,
-            });
-          }
-        }
-      );
-      controlsRef.current = controls;
-    } catch (err) {
-      setCameraActive(false);
-      setCameraError(
-        err instanceof Error
-          ? `Izin kamera ditolak atau kamera tidak ditemukan (${err.message}). Gunakan input Scanner USB / ketik barcode.`
-          : 'Gagal membuka kamera. Gunakan input Scanner USB / ketik barcode.'
-      );
-    }
+    setCameraReady(false);
+    setCameraActive(true);
   };
 
   const addLineItem = () => {
@@ -484,7 +537,7 @@ export function IncomingTransactionsPage() {
                   {!cameraActive ? (
                     <button
                       type="button"
-                      onClick={() => void startCamera()}
+                      onClick={startCamera}
                       className="inline-flex items-center gap-1.5 px-3 py-1.5 border border-slate-300 bg-white text-slate-800 text-xs font-medium rounded-lg hover:bg-slate-100"
                     >
                       <Camera className="w-3.5 h-3.5 text-red-800" />
@@ -592,9 +645,21 @@ export function IncomingTransactionsPage() {
                   )}
 
                   {cameraActive && (
-                    <div className="relative bg-slate-900 rounded-lg overflow-hidden aspect-[16/9] max-h-52 flex items-center justify-center">
-                      <video ref={videoRef} className="w-full h-full object-cover" muted playsInline />
-                      <div className="absolute bottom-2 left-2 right-2 text-center">
+                    <div className="relative w-full h-56 bg-slate-900 rounded-lg overflow-hidden flex items-center justify-center">
+                      <video
+                        ref={videoRef}
+                        autoPlay
+                        muted
+                        playsInline
+                        onPlaying={() => setCameraReady(true)}
+                        className="w-full h-full object-cover"
+                      />
+                      {!cameraReady && (
+                        <div className="absolute inset-0 flex items-center justify-center bg-slate-900/80 text-white text-xs">
+                          Menghubungkan kamera perangkat...
+                        </div>
+                      )}
+                      <div className="absolute bottom-2 left-2 right-2 text-center pointer-events-none">
                         <span className="inline-block px-2.5 py-1 bg-slate-950/75 text-white text-[11px] rounded">
                           Arahkan kamera ke label barcode barang
                         </span>
