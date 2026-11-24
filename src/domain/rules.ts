@@ -1677,3 +1677,75 @@ export function validateUsernamePasswordInput(params: {
   }
   return { valid: true, normalizedUsername };
 }
+
+export function findMasterItemByBarcodeOrCode(
+  items: readonly InventoryItem[],
+  rawQuery: string
+): InventoryItem | null {
+  const normalized = rawQuery.trim().toUpperCase();
+  if (!normalized) return null;
+
+  // Prefer active items if duplicates exist, falling back to any matching record
+  const byBarcode =
+    items.find((i) => i.active && i.barcode.trim().toUpperCase() === normalized) ??
+    items.find((i) => i.barcode.trim().toUpperCase() === normalized);
+  if (byBarcode) return byBarcode;
+
+  const byCode =
+    items.find((i) => i.active && i.code.trim().toUpperCase() === normalized) ??
+    items.find((i) => i.code.trim().toUpperCase() === normalized);
+  return byCode ?? null;
+}
+
+export function searchMasterItemsForPicker(
+  items: readonly InventoryItem[],
+  rawQuery: string,
+  limit = 6
+): InventoryItem[] {
+  const q = rawQuery.trim().toLowerCase();
+  if (!q) return [];
+  const matches = items.filter(
+    (i) =>
+      i.barcode.toLowerCase().includes(q) ||
+      i.code.toLowerCase().includes(q) ||
+      i.name.toLowerCase().includes(q) ||
+      i.specification.toLowerCase().includes(q)
+  );
+  return matches.slice(0, Math.max(1, limit));
+}
+
+export function upsertIncomingLineItem(
+  lines: readonly IncomingLineItem[],
+  item: InventoryItem,
+  qtyToAdd: number
+): IncomingLineItem[] {
+  const safeQty = Math.floor(qtyToAdd);
+  if (safeQty <= 0) return [...lines];
+
+  const existing = lines.find((l) => l.itemId === item.id);
+  if (existing) {
+    return lines.map((l) => {
+      if (l.itemId !== item.id) return l;
+      const nextQty = l.qty + safeQty;
+      return {
+        ...l,
+        qty: nextQty,
+        subtotal: nextQty * l.price,
+      };
+    });
+  }
+
+  return [
+    ...lines,
+    {
+      itemId: item.id,
+      itemCode: item.code,
+      itemName: item.name,
+      unitName: item.unitName,
+      qty: safeQty,
+      price: item.purchasePrice,
+      subtotal: safeQty * item.purchasePrice,
+    },
+  ];
+}
+

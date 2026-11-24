@@ -41,6 +41,7 @@ import {
   sha256Hex,
   shouldExpireClosedTabSession,
   sortItemsByCode,
+  upsertIncomingLineItem,
   usernameToCredentialId,
   usernameToInternalAuthEmail,
   usernameToStaffUid,
@@ -50,6 +51,8 @@ import {
   validateSupplierUniqueness,
   validateUnitUniqueness,
   validateUsernamePasswordInput,
+  findMasterItemByBarcodeOrCode,
+  searchMasterItemsForPicker,
 } from './rules';
 import type {
   IncomingTransaction,
@@ -1050,3 +1053,41 @@ test('Username/Password salted SHA-256 credentials, lossless IDs, validation, an
   assert.equal(validRes.valid, true);
   assert.equal(validRes.normalizedUsername, 'admin_gudang2');
 });
+
+test('Incoming barcode lookup matches master items by barcode/code and merges line items cleanly', () => {
+  const catalog: InventoryItem[] = [
+    makeItem({ id: 'i1', code: 'BRG-001', barcode: 'IMS-100001', name: 'Plat Baja 2mm', purchasePrice: 120000 }),
+    makeItem({ id: 'i2', code: 'BRG-002', barcode: '8991234567890', name: 'Kabel NYYHY', purchasePrice: 85000 }),
+    makeItem({ id: 'i3', code: 'BRG-003', barcode: 'IMS-300003', name: 'Baut Lama', active: false, purchasePrice: 5000 }),
+  ];
+
+  // Exact barcode lookup (case-insensitive & trimmed)
+  assert.equal(findMasterItemByBarcodeOrCode(catalog, '  ims-100001 ')?.id, 'i1');
+  assert.equal(findMasterItemByBarcodeOrCode(catalog, '8991234567890')?.id, 'i2');
+  // Fallback exact item code lookup
+  assert.equal(findMasterItemByBarcodeOrCode(catalog, 'brg-002')?.id, 'i2');
+  // Unknown barcode returns null
+  assert.equal(findMasterItemByBarcodeOrCode(catalog, 'TIDAK-ADA'), null);
+  assert.equal(findMasterItemByBarcodeOrCode(catalog, '   '), null);
+
+  // Partial search suggestions
+  assert.equal(searchMasterItemsForPicker(catalog, 'kabel').length, 1);
+  assert.equal(searchMasterItemsForPicker(catalog, '89912').length, 1);
+  assert.equal(searchMasterItemsForPicker(catalog, '').length, 0);
+
+  // Upserting incoming lines creates and accumulates quantities & subtotals
+  const step1 = upsertIncomingLineItem([], catalog[0], 3);
+  assert.equal(step1.length, 1);
+  assert.equal(step1[0].qty, 3);
+  assert.equal(step1[0].subtotal, 360000);
+
+  const step2 = upsertIncomingLineItem(step1, catalog[0], 2);
+  assert.equal(step2.length, 1);
+  assert.equal(step2[0].qty, 5);
+  assert.equal(step2[0].subtotal, 600000);
+
+  const step3 = upsertIncomingLineItem(step2, catalog[1], 4);
+  assert.equal(step3.length, 2);
+  assert.equal(step3[1].subtotal, 340000);
+});
+
